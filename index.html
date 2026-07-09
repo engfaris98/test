@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>SpicyWiFi Management</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+<script src="https://unpkg.com/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;900&family=IBM+Plex+Mono:wght@500;600&display=swap');
+* { font-family: 'Tajawal', sans-serif; box-sizing: border-box; margin:0; padding:0; }
+.mono { font-family: 'IBM Plex Mono', monospace; direction: ltr; unicode-bidi: plaintext; }
+body { background:#F3F6F5; }
+@media print {
+  body * { visibility: hidden; }
+  #print-receipt, #print-receipt * { visibility: visible; }
+  #print-receipt { position: absolute; inset: 0; width: 100%; }
+}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useMemo, useCallback } = React;
+
+/* ---------------- design tokens ---------------- */
+const C = {
+  paper: "#F3F6F5", surface: "#FFFFFF", ink: "#122024", muted: "#657379", line: "#E2E8E7",
+  brand: "#0E3B43", brandSoft: "#DCEBEA", accent: "#17B6C4",
+  success: "#2F9E6E", successSoft: "#E3F5EC",
+  warning: "#C98A1E", warningSoft: "#FBEED9",
+  danger: "#D14343", dangerSoft: "#FAE1E1",
+};
+
+const genId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+const addMonths = (dateStr, months) => { const d = new Date(dateStr); d.setMonth(d.getMonth() + Number(months)); return d.toISOString().slice(0, 10); };
+const todayStr = () => new Date().toISOString().slice(0, 10);
+const fmtDate = (dateStr) => { if (!dateStr) return "—"; const d = new Date(dateStr); return d.toLocaleDateString("ar-EG-u-nu-latn", { year: "numeric", month: "long", day: "numeric" }); };
+const daysRemaining = (endDate) => { const end = new Date(endDate); const now = new Date(todayStr()); return Math.round((end - now) / 86400000); };
+const getStatus = (endDate) => { const d = daysRemaining(endDate); if (d < 0) return { key: "expired", label: "منتهي", color: C.danger, soft: C.dangerSoft }; if (d <= 5) return { key: "soon", label: "قريب الانتهاء", color: C.warning, soft: C.warningSoft }; return { key: "active", label: "نشط", color: C.success, soft: C.successSoft }; };
+
+/* ---------------- local storage (data on the phone only) ---------------- */
+function loadKey(key, fallback) { try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; } catch (e) { console.error("loadKey failed", key, e); return fallback; } }
+function saveKey(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+    return true;
+  } catch (e) {
+    console.error("saveKey failed", key, e);
+    alert("⚠️ ما قدر يحفظ البيانات على هذا الجهاز/المتصفح. جرّب تفتح الملف من متصفح Chrome عادي (مو من واتساب أو تطبيق ملفات مباشرة) أو فعّل تخزين الموقع (Site Data) من إعدادات المتصفح.");
+    return false;
+  }
+}
+
+
+/* ---------------- backup to file ---------------- */
+function exportBackupFile() {
+  const payload = {
+    subscribers: loadKey("isp_subscribers", []),
+    payments: loadKey("isp_payments", []),
+    settings: loadKey("isp_settings", {}),
+    packages: loadKey("isp_packages", []),
+    savedAt: new Date().toISOString(),
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const stamp = new Date().toISOString().slice(0, 10);
+  a.href = url; a.download = `spicywifi-backup-${stamp}.json`;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+function importBackupFile(file, onDone) {
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const data = JSON.parse(e.target.result);
+      saveKey("isp_subscribers", data.subscribers || []);
+      saveKey("isp_payments", data.payments || []);
+      saveKey("isp_settings", data.settings || {});
+      saveKey("isp_packages", data.packages || []);
+      onDone(true);
+    } catch (err) {
+      onDone(false, err.message);
+    }
+  };
+  reader.onerror = () => onDone(false, "تعذرت قراءة الملف");
+  reader.readAsText(file);
+}
+
+  const d = daysRemaining(endDate);
+  let filled = d > 15 ? 4 : d > 7 ? 3 : d > 0 ? 2 : d === 0 ? 1 : 0;
+  const status = getStatus(endDate);
+  const h = size === "sm" ? [5, 8, 11, 14] : [7, 11, 15, 19];
+  return React.createElement("div", { style: { display: "flex", alignItems: "flex-end", gap: 2, height: h[3] } },
+    h.map((barH, i) => React.createElement("div", { key: i, style: { width: size === "sm" ? 3 : 4, height: barH, borderRadius: 2, background: i < filled ? status.color : C.line } }))
+  );
+}
+function Badge({ status }) {
+  return React.createElement("span", { style: { background: status.soft, color: status.color, fontSize: 12, fontWeight: 700, padding: "3px 10px", borderRadius: 999, whiteSpace: "nowrap" } }, status.label);
+}
+function TopBar({ title, onBack }) {
+  return React.createElement("div", { className: "no-print", style: { background: `linear-gradient(135deg, ${C.brand} 0%, #0A2E34 100%)`, color: "#fff", padding: "18px 16px", display: "flex", alignItems: "center", gap: 12, boxShadow: "0 4px 14px rgba(14,59,67,.25)" } },
+    onBack && React.createElement("button", { onClick: onBack, style: { background: "rgba(255,255,255,.14)", border: "none", color: "#fff", borderRadius: 10, padding: 8, display: "flex" } }, "→"),
+    !onBack && React.createElement("div", { style: { background: C.accent, borderRadius: 11, width: 38, height: 38, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 900, fontSize: 17, color: C.brand, boxShadow: "0 2px 6px rgba(0,0,0,.2)" } }, "S"),
+    onBack
+      ? React.createElement("span", { style: { fontWeight: 900, fontSize: 17 } }, title)
+      : React.createElement("div", null,
+          React.createElement("div", { style: { fontWeight: 900, fontSize: 17, letterSpacing: .2 } }, "SpicyWiFi ", React.createElement("span", { style: { color: C.accent } }, "Management")),
+          React.createElement("div", { style: { fontSize: 11.5, color: "rgba(255,255,255,.65)", marginTop: 1 } }, "لوحة إدارة مشتركين الإنترنت")
+        )
+  );
+}
+function Field({ label, children }) {
+  return React.createElement("label", { style: { display: "block", marginBottom: 14 } },
+    React.createElement("div", { style: { fontSize: 13, fontWeight: 700, color: C.muted, marginBottom: 6 } }, label), children);
+}
+const inputStyle = { width: "100%", padding: "11px 12px", borderRadius: 10, border: `1.5px solid ${C.line}`, fontSize: 15, color: C.ink, background: "#fff", outline: "none" };
+function PrimaryButton({ children, onClick, full, disabled }) {
+  return React.createElement("button", { onClick, disabled, style: { background: disabled ? C.line : C.brand, color: disabled ? C.muted : "#fff", border: "none", borderRadius: 12, padding: "13px 18px", fontWeight: 700, fontSize: 15, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: full ? "100%" : "auto", cursor: disabled ? "not-allowed" : "pointer" } }, children);
+}
+const ghostBtn = { border: `1.5px solid ${C.line}`, background: "#fff", borderRadius: 12, padding: "12px 10px", fontWeight: 700, fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, cursor: "pointer" };
+
+function StatTile({ label, value, color }) {
+  return React.createElement("div", { style: { flex: 1, background: C.surface, borderRadius: 14, padding: "12px 10px", textAlign: "center", boxShadow: "0 1px 3px rgba(18,32,36,.06)", border: `1px solid ${C.line}` } },
+    React.createElement("div", { className: "mono", style: { fontSize: 20, fontWeight: 800, color: color || C.ink } }, value),
+    React.createElement("div", { style: { fontSize: 11, color: C.muted, marginTop: 2, fontWeight: 700 } }, label)
+  );
+}
+
+function HomeScreen({ subs, onOpen, onAdd }) {
+  const [q, setQ] = useState(""); const [filter, setFilter] = useState("all");
+  const counts = useMemo(() => { const c = { all: subs.length, active: 0, soon: 0, expired: 0 }; subs.forEach((s) => (c[getStatus(s.endDate).key] += 1)); return c; }, [subs]);
+  const filtered = subs.filter((s) => (filter === "all" ? true : getStatus(s.endDate).key === filter))
+    .filter((s) => (s.name + s.phone).toLowerCase().includes(q.toLowerCase()))
+    .sort((a, b) => daysRemaining(a.endDate) - daysRemaining(b.endDate));
+  const chips = [{ key: "all", label: `الكل (${counts.all})` }, { key: "active", label: `نشط (${counts.active})` }, { key: "soon", label: `قريب الانتهاء (${counts.soon})` }, { key: "expired", label: `منتهي (${counts.expired})` }];
+  return React.createElement("div", { style: { paddingBottom: 90 } },
+    React.createElement("div", { style: { padding: "14px 14px 0" } },
+      React.createElement("div", { style: { display: "flex", gap: 8, marginBottom: 14 } },
+        React.createElement(StatTile, { label: "الكل", value: counts.all }),
+        React.createElement(StatTile, { label: "نشط", value: counts.active, color: C.success }),
+        React.createElement(StatTile, { label: "قريب الانتهاء", value: counts.soon, color: C.warning }),
+        React.createElement(StatTile, { label: "منتهي", value: counts.expired, color: C.danger })
+      )
+    ),
+    React.createElement("div", { style: { padding: 14 } },
+      React.createElement("input", { placeholder: "بحث بالاسم أو رقم الهاتف", value: q, onChange: (e) => setQ(e.target.value), style: { ...inputStyle, marginBottom: 12 } }),
+      React.createElement("div", { style: { display: "flex", gap: 8, overflowX: "auto" } },
+        chips.map((c) => React.createElement("button", { key: c.key, onClick: () => setFilter(c.key), style: { flexShrink: 0, padding: "7px 14px", borderRadius: 999, border: `1.5px solid ${filter === c.key ? C.brand : C.line}`, background: filter === c.key ? C.brand : "#fff", color: filter === c.key ? "#fff" : C.ink, fontSize: 13, fontWeight: 700 } }, c.label))
+      )
+    ),
+    React.createElement("div", { style: { padding: "0 14px", display: "flex", flexDirection: "column", gap: 10 } },
+      filtered.length === 0 && React.createElement("div", { style: { textAlign: "center", color: C.muted, padding: "40px 10px" } }, "ما فيه مشتركين. اضغط + بالأسفل"),
+      filtered.map((s) => {
+        const status = getStatus(s.endDate); const d = daysRemaining(s.endDate);
+        return React.createElement("div", { key: s.id, onClick: () => onOpen(s), style: { background: C.surface, borderRadius: 14, padding: 14, border: `1px solid ${C.line}`, boxShadow: "0 1px 3px rgba(18,32,36,.06)", cursor: "pointer" } },
+          React.createElement("div", { style: { display: "flex", justifyContent: "space-between" } },
+            React.createElement("div", null,
+              React.createElement("div", { style: { fontWeight: 800, fontSize: 15.5 } }, s.name),
+              React.createElement("div", { className: "mono", style: { fontSize: 12.5, color: C.muted } }, s.phone)
+            ),
+            React.createElement(Badge, { status })
+          ),
+          React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 12 } },
+            React.createElement("div", { style: { fontSize: 12.5, color: C.muted } }, s.package, " · ", React.createElement("span", { className: "mono" }, s.price)),
+            React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
+              React.createElement("span", { style: { fontSize: 12, fontWeight: 700, color: status.color } }, d >= 0 ? `${d} يوم متبقي` : `متأخر ${Math.abs(d)} يوم`),
+              React.createElement(SignalBars, { endDate: s.endDate, size: "sm" })
+            )
+          )
+        );
+      })
+    ),
+    React.createElement("button", { onClick: onAdd, className: "no-print", style: { position: "fixed", bottom: 84, left: "50%", transform: "translateX(calc(-50% + 190px))", background: C.accent, color: C.brand, border: "none", borderRadius: 999, width: 54, height: 54, fontSize: 24, boxShadow: "0 6px 16px rgba(14,59,67,.3)" } }, "＋")
+  );
+}
+
+function SubscriberForm({ initial, onSave, onCancel, title, packages }) {
+  const [f, setF] = useState(initial || { name: "", phone: "", address: "", package: "", price: "", durationMonths: 1, startDate: todayStr() });
+  const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
+  const valid = f.name.trim() && f.phone.trim() && f.package.trim() && f.price !== "";
+  const pickPackage = (pkgName) => {
+    const pkg = (packages || []).find((p) => p.name === pkgName);
+    setF((p) => ({ ...p, package: pkgName, price: pkg && pkg.price !== "" ? pkg.price : p.price }));
+  };
+  return React.createElement("div", { style: { padding: 16, paddingBottom: 100 } },
+    React.createElement("div", { style: { fontWeight: 800, fontSize: 15, marginBottom: 14, color: C.muted } }, title),
+    React.createElement(Field, { label: "اسم المشترك *" }, React.createElement("input", { style: inputStyle, value: f.name, onChange: (e) => set("name", e.target.value) })),
+    React.createElement(Field, { label: "رقم الهاتف *" }, React.createElement("input", { style: inputStyle, className: "mono", dir: "ltr", value: f.phone, onChange: (e) => set("phone", e.target.value) })),
+    React.createElement(Field, { label: "العنوان (اختياري)" }, React.createElement("input", { style: inputStyle, value: f.address, onChange: (e) => set("address", e.target.value) })),
+    React.createElement(Field, { label: "الباقة *" },
+      React.createElement("input", { style: inputStyle, list: "pkg-list", value: f.package, onChange: (e) => pickPackage(e.target.value) }),
+      React.createElement("datalist", { id: "pkg-list" }, (packages || []).map((p) => React.createElement("option", { key: p.id, value: p.name })))
+    ),
+    React.createElement("div", { style: { display: "flex", gap: 10 } },
+      React.createElement("div", { style: { flex: 1 } }, React.createElement(Field, { label: "السعر *" }, React.createElement("input", { style: inputStyle, className: "mono", dir: "ltr", type: "number", value: f.price, onChange: (e) => set("price", e.target.value) }))),
+      React.createElement("div", { style: { flex: 1 } }, React.createElement(Field, { label: "المدة (أشهر) *" }, React.createElement("select", { style: inputStyle, value: f.durationMonths, onChange: (e) => set("durationMonths", e.target.value) }, [1, 2, 3, 6, 12].map((m) => React.createElement("option", { key: m, value: m }, `${m} شهر`)))))
+    ),
+    React.createElement(Field, { label: "تاريخ بداية الاشتراك" }, React.createElement("input", { style: inputStyle, type: "date", value: f.startDate, onChange: (e) => set("startDate", e.target.value) })),
+    React.createElement(PrimaryButton, { full: true, disabled: !valid, onClick: () => onSave(f) }, "حفظ وتفعيل"),
+    React.createElement("button", { onClick: onCancel, style: { width: "100%", marginTop: 10, background: "none", border: "none", color: C.muted, fontWeight: 700, padding: 10 } }, "إلغاء")
+  );
+}
+
+function DetailSheet({ sub, onClose, onEdit, onRenew, onDelete, onReceipt }) {
+  const status = getStatus(sub.endDate); const d = daysRemaining(sub.endDate);
+  return React.createElement("div", { style: { position: "fixed", inset: 0, background: "rgba(10,20,22,.45)", display: "flex", alignItems: "flex-end", zIndex: 40 }, onClick: onClose },
+    React.createElement("div", { onClick: (e) => e.stopPropagation(), style: { background: "#fff", width: "100%", maxWidth: 460, margin: "0 auto", borderRadius: "20px 20px 0 0", padding: 20, maxHeight: "82vh", overflowY: "auto" } },
+      React.createElement("div", { style: { width: 40, height: 4, background: C.line, borderRadius: 4, margin: "0 auto 16px" } }),
+      React.createElement("div", { style: { display: "flex", justifyContent: "space-between" } }, React.createElement("div", { style: { fontWeight: 900, fontSize: 19 } }, sub.name), React.createElement(Badge, { status })),
+      React.createElement("div", { className: "mono", style: { color: C.muted, fontSize: 13, marginBottom: 18 } }, sub.phone),
+      React.createElement("div", { style: { background: C.paper, borderRadius: 14, padding: 14, display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18 } },
+        React.createElement("div", null,
+          React.createElement("div", { style: { fontSize: 12, color: C.muted } }, "الباقة"),
+          React.createElement("div", { style: { fontWeight: 800 } }, sub.package, " · ", React.createElement("span", { className: "mono" }, sub.price)),
+          React.createElement("div", { style: { fontSize: 12, color: C.muted, marginTop: 8 } }, fmtDate(sub.startDate), " ← ", fmtDate(sub.endDate))
+        ),
+        React.createElement("div", { style: { textAlign: "center" } }, React.createElement(SignalBars, { endDate: sub.endDate }), React.createElement("div", { style: { fontSize: 11, fontWeight: 700, color: status.color, marginTop: 4 } }, d >= 0 ? `${d} يوم` : `متأخر ${Math.abs(d)}`))
+      ),
+      React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 } },
+        React.createElement(PrimaryButton, { onClick: () => onRenew(sub) }, "↻ تجديد الاشتراك"),
+        React.createElement("button", { onClick: () => onReceipt(sub), style: ghostBtn }, "🖨 آخر وصل"),
+        React.createElement("button", { onClick: () => onEdit(sub), style: ghostBtn }, "✏ تعديل البيانات"),
+        React.createElement("button", { onClick: () => onDelete(sub), style: { ...ghostBtn, color: C.danger } }, "🗑 حذف")
+      )
+    )
+  );
+}
+
+function RenewForm({ sub, onSave, onCancel, packages }) {
+  const base = daysRemaining(sub.endDate) > 0 ? sub.endDate : todayStr();
+  const [f, setF] = useState({ package: sub.package, price: sub.price, durationMonths: 1, startDate: base });
+  const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
+  const pickPackage = (pkgName) => {
+    const pkg = (packages || []).find((p) => p.name === pkgName);
+    setF((p) => ({ ...p, package: pkgName, price: pkg && pkg.price !== "" ? pkg.price : p.price }));
+  };
+  const newEnd = addMonths(f.startDate, f.durationMonths);
+  return React.createElement("div", { style: { padding: 16, paddingBottom: 100 } },
+    React.createElement("div", { style: { fontWeight: 800 } }, "تجديد اشتراك: ", sub.name),
+    React.createElement("div", { style: { fontSize: 13, color: C.muted, marginBottom: 16 } }, "الانتهاء الحالي: ", fmtDate(sub.endDate)),
+    React.createElement(Field, { label: "الباقة" },
+      React.createElement("input", { style: inputStyle, list: "pkg-list-renew", value: f.package, onChange: (e) => pickPackage(e.target.value) }),
+      React.createElement("datalist", { id: "pkg-list-renew" }, (packages || []).map((p) => React.createElement("option", { key: p.id, value: p.name })))
+    ),
+    React.createElement("div", { style: { display: "flex", gap: 10 } },
+      React.createElement("div", { style: { flex: 1 } }, React.createElement(Field, { label: "السعر" }, React.createElement("input", { style: inputStyle, className: "mono", dir: "ltr", type: "number", value: f.price, onChange: (e) => set("price", e.target.value) }))),
+      React.createElement("div", { style: { flex: 1 } }, React.createElement(Field, { label: "مدة التجديد" }, React.createElement("select", { style: inputStyle, value: f.durationMonths, onChange: (e) => set("durationMonths", e.target.value) }, [1, 2, 3, 6, 12].map((m) => React.createElement("option", { key: m, value: m }, `${m} شهر`)))))
+    ),
+    React.createElement(Field, { label: "يبدأ من" }, React.createElement("input", { style: inputStyle, type: "date", value: f.startDate, onChange: (e) => set("startDate", e.target.value) })),
+    React.createElement("div", { style: { background: C.brandSoft, borderRadius: 12, padding: 12, marginBottom: 16, fontSize: 13.5, fontWeight: 700, color: C.brand } }, "ينتهي في: ", fmtDate(newEnd)),
+    React.createElement(PrimaryButton, { full: true, onClick: () => onSave(f) }, "تأكيد وطباعة الوصل"),
+    React.createElement("button", { onClick: onCancel, style: { width: "100%", marginTop: 10, background: "none", border: "none", color: C.muted, fontWeight: 700, padding: 10 } }, "إلغاء")
+  );
+}
+
+function ReceiptScreen({ payment, settings, onDone }) {
+  if (!payment) return null;
+  const [busy, setBusy] = useState(false);
+  const rows = [["المشترك", payment.subscriberName], ["رقم الهاتف", payment.subscriberPhone], ["الباقة", payment.package], ["المدة", `${payment.durationMonths} شهر`], ["تاريخ البداية", fmtDate(payment.startDate)], ["تاريخ الانتهاء", fmtDate(payment.endDate)]];
+  const captureCanvas = async () => {
+    const el = document.getElementById("print-receipt");
+    return await html2canvas(el, { scale: 2, backgroundColor: "#ffffff" });
+  };
+  const downloadPDF = async () => {
+    setBusy(true);
+    try {
+      const canvas = await captureCanvas();
+      const imgData = canvas.toDataURL("image/png");
+      const { jsPDF } = window.jspdf;
+      const w = canvas.width / 2, h = canvas.height / 2;
+      const pdf = new jsPDF({ unit: "pt", format: [w, h] });
+      pdf.addImage(imgData, "PNG", 0, 0, w, h);
+      pdf.save(`وصل-${payment.receiptNo}.pdf`);
+    } catch (e) {
+      alert("تعذر إنشاء ملف PDF، جرّب زر الطباعة بدلاً منه");
+      console.error(e);
+    }
+    setBusy(false);
+  };
+  const saveImage = async () => {
+    setBusy(true);
+    try {
+      const canvas = await captureCanvas();
+      canvas.toBlob((blob) => {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = `وصل-${payment.receiptNo}.png`;
+        document.body.appendChild(a); a.click(); a.remove();
+        URL.revokeObjectURL(url);
+      }, "image/png");
+    } catch (e) {
+      alert("تعذر إنشاء الصورة");
+      console.error(e);
+    }
+    setBusy(false);
+  };
+  const shareReceipt = async () => {
+    setBusy(true);
+    try {
+      const canvas = await captureCanvas();
+      canvas.toBlob(async (blob) => {
+        const file = new File([blob], `وصل-${payment.receiptNo}.png`, { type: "image/png" });
+        if (navigator.canShare && navigator.canShare({ files: [file] })) {
+          await navigator.share({ files: [file], title: "وصل الاشتراك", text: `وصل اشتراك ${payment.subscriberName}` });
+        } else {
+          alert("متصفحك ما يدعم المشاركة المباشرة، بيتم تنزيل الصورة عشان ترسلها يدويًا");
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url; a.download = `وصل-${payment.receiptNo}.png`;
+          document.body.appendChild(a); a.click(); a.remove();
+          URL.revokeObjectURL(url);
+        }
+        setBusy(false);
+      }, "image/png");
+    } catch (e) {
+      console.error(e);
+      setBusy(false);
+    }
+  };
+  return React.createElement("div", { style: { padding: 16 } },
+    React.createElement("div", { id: "print-receipt", style: { background: "#fff", border: `1.5px solid ${C.line}`, borderRadius: 16, padding: 22, maxWidth: 420, margin: "0 auto" } },
+      React.createElement("div", { style: { textAlign: "center", marginBottom: 16, paddingBottom: 16, borderBottom: `1.5px dashed ${C.line}` } },
+        React.createElement("div", { style: { fontWeight: 900, fontSize: 17 } }, settings.companyName || "اسم الشركة"),
+        settings.companyPhone && React.createElement("div", { className: "mono", style: { fontSize: 12.5, color: C.muted } }, settings.companyPhone)
+      ),
+      React.createElement("div", { style: { display: "flex", justifyContent: "space-between", fontSize: 12.5, color: C.muted, marginBottom: 14 } },
+        React.createElement("span", null, "رقم الوصل: ", React.createElement("b", { className: "mono" }, payment.receiptNo)),
+        React.createElement("span", { className: "mono" }, fmtDate(payment.createdAt))
+      ),
+      React.createElement("table", { style: { width: "100%", fontSize: 13.5, borderCollapse: "collapse" } },
+        React.createElement("tbody", null, rows.map(([k, v]) => React.createElement("tr", { key: k }, React.createElement("td", { style: { padding: "8px 0", color: C.muted } }, k), React.createElement("td", { style: { padding: "8px 0", fontWeight: 700, textAlign: "left" } }, v))))
+      ),
+      React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 16, paddingTop: 14, borderTop: `1.5px dashed ${C.line}` } },
+        React.createElement("span", { style: { fontWeight: 800 } }, "المبلغ المدفوع"),
+        React.createElement("span", { className: "mono", style: { fontWeight: 900, fontSize: 20, color: C.brand } }, `${payment.price} ${settings.currency || ""}`)
+      )
+    ),
+    React.createElement("div", { className: "no-print", style: { maxWidth: 420, margin: "18px auto 0", display: "flex", flexDirection: "column", gap: 10 } },
+      React.createElement(PrimaryButton, { full: true, disabled: busy, onClick: shareReceipt }, busy ? "جاري التجهيز..." : "📤 مشاركة الوصل (واتساب/ماسنجر)"),
+      React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 } },
+        React.createElement("button", { disabled: busy, onClick: saveImage, style: ghostBtn }, "🖼 حفظ كصورة"),
+        React.createElement("button", { disabled: busy, onClick: downloadPDF, style: ghostBtn }, "⬇ حفظ PDF")
+      ),
+      React.createElement("button", { onClick: () => window.print(), style: ghostBtn }, "🖨 طباعة مباشرة")
+    ),
+    React.createElement("button", { className: "no-print", onClick: onDone, style: { width: "100%", marginTop: 10, background: "none", border: "none", color: C.muted, fontWeight: 700, padding: 10 } }, "رجوع للرئيسية")
+  );
+}
+
+function HistoryScreen({ payments, onOpen }) {
+  const sorted = [...payments].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  return React.createElement("div", { style: { padding: 14, paddingBottom: 90 } },
+    sorted.length === 0 && React.createElement("div", { style: { textAlign: "center", color: C.muted, padding: "50px 10px" } }, "ما فيه وصولات لسه"),
+    React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 10 } },
+      sorted.map((p) => React.createElement("div", { key: p.id, onClick: () => onOpen(p), style: { background: C.surface, border: `1px solid ${C.line}`, borderRadius: 14, padding: 14, cursor: "pointer", display: "flex", justifyContent: "space-between" } },
+        React.createElement("div", null, React.createElement("div", { style: { fontWeight: 800, fontSize: 14.5 } }, p.subscriberName), React.createElement("div", { style: { fontSize: 12, color: C.muted } }, p.package, " · ", React.createElement("span", { className: "mono" }, fmtDate(p.createdAt)))),
+        React.createElement("div", { style: { textAlign: "left" } }, React.createElement("div", { className: "mono", style: { fontWeight: 800, color: C.brand } }, p.price), React.createElement("div", { className: "mono", style: { fontSize: 11, color: C.muted } }, p.receiptNo))
+      ))
+    )
+  );
+}
+
+function PackagesScreen({ packages, onSave, onBack }) {
+  const [name, setName] = useState("");
+  const [price, setPrice] = useState("");
+  const add = () => {
+    if (!name.trim()) return;
+    onSave([...packages, { id: genId(), name: name.trim(), price }]);
+    setName(""); setPrice("");
+  };
+  const remove = (id) => onSave(packages.filter((p) => p.id !== id));
+  return React.createElement("div", { style: { padding: 16, paddingBottom: 100 } },
+    React.createElement("div", { style: { fontWeight: 800, fontSize: 15, marginBottom: 14, color: C.muted } }, "أضف باقات جاهزة عشان تظهر كاقتراحات سريعة عند إضافة أو تجديد مشترك"),
+    React.createElement("div", { style: { display: "flex", gap: 8, marginBottom: 16 } },
+      React.createElement("input", { style: { ...inputStyle, flex: 2 }, placeholder: "اسم الباقة (مثال: 20 ميجا)", value: name, onChange: (e) => setName(e.target.value) }),
+      React.createElement("input", { style: { ...inputStyle, flex: 1 }, className: "mono", dir: "ltr", type: "number", placeholder: "السعر", value: price, onChange: (e) => setPrice(e.target.value) }),
+      React.createElement("button", { onClick: add, style: { background: C.brand, color: "#fff", border: "none", borderRadius: 10, padding: "0 16px", fontWeight: 800 } }, "＋")
+    ),
+    React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8 } },
+      packages.length === 0 && React.createElement("div", { style: { textAlign: "center", color: C.muted, padding: "20px 0" } }, "ما فيه باقات مضافة بعد"),
+      packages.map((p) => React.createElement("div", { key: p.id, style: { background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center" } },
+        React.createElement("div", null, React.createElement("span", { style: { fontWeight: 700 } }, p.name), p.price !== "" && React.createElement("span", { className: "mono", style: { color: C.muted, marginRight: 8 } }, p.price)),
+        React.createElement("button", { onClick: () => remove(p.id), style: { background: "none", border: "none", color: C.danger, fontWeight: 700 } }, "🗑")
+      ))
+    )
+  );
+}
+
+
+function SettingsScreen({ settings, onSave, onOpenPackages }) {
+  const [f, setF] = useState(settings);
+  const [diag, setDiag] = useState(null);
+  const [backupMsg, setBackupMsg] = useState(null);
+  const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
+
+  const doExport = () => { exportBackupFile(); setBackupMsg({ ok: true, msg: "تم تنزيل ملف النسخة الاحتياطية ✅ — تقدر تحفظه بتطبيق الملفات أو ترسله لنفسك بواتساب/الإيميل لأمان أكثر." }); };
+  const doImport = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    if (!window.confirm("هذا يستبدل كل بياناتك الحالية بمحتوى الملف. متأكد؟")) return;
+    importBackupFile(file, (ok, err) => {
+      setBackupMsg(ok ? { ok: true, msg: "تم استرجاع البيانات ✅ — أعد فتح التطبيق عشان تظهر." } : { ok: false, msg: "تعذر قراءة الملف: " + err });
+    });
+  };
+
+  const testStorage = () => {
+    try {
+      localStorage.setItem("__diag_test__", "ok-" + Date.now());
+      const readBack = localStorage.getItem("__diag_test__");
+      if (readBack && readBack.startsWith("ok-")) {
+        setDiag({ ok: true, msg: "✅ التخزين شغال ممتاز على هذا المتصفح." });
+      } else {
+        setDiag({ ok: false, msg: "❌ المتصفح ما يسمح بالتخزين. جرب متصفح Chrome أو Safari عادي، وتأكد إنك مو بوضع تصفح خاص (Private/Incognito)." });
+      }
+    } catch (e) {
+      setDiag({ ok: false, msg: "❌ فشل التخزين تمامًا: " + e.message });
+    }
+  };
+  return React.createElement("div", { style: { padding: 16, paddingBottom: 100 } },
+    React.createElement(Field, { label: "اسم الشركة / الشبكة" }, React.createElement("input", { style: inputStyle, value: f.companyName, onChange: (e) => set("companyName", e.target.value) })),
+    React.createElement(Field, { label: "رقم التواصل" }, React.createElement("input", { style: inputStyle, className: "mono", dir: "ltr", value: f.companyPhone, onChange: (e) => set("companyPhone", e.target.value) })),
+    React.createElement(Field, { label: "العنوان" }, React.createElement("input", { style: inputStyle, value: f.address, onChange: (e) => set("address", e.target.value) })),
+    React.createElement(Field, { label: "رمز العملة" }, React.createElement("input", { style: inputStyle, value: f.currency, onChange: (e) => set("currency", e.target.value) })),
+    React.createElement(PrimaryButton, { full: true, onClick: () => onSave(f) }, "حفظ الإعدادات"),
+    React.createElement("button", { onClick: onOpenPackages, style: { ...ghostBtn, width: "100%", marginTop: 12 } }, "📦 إدارة الباقات"),
+
+    React.createElement("div", { style: { marginTop: 24, paddingTop: 16, borderTop: `1px solid ${C.line}` } },
+      React.createElement("div", { style: { fontWeight: 800, fontSize: 14, marginBottom: 8, color: C.muted } }, "نسخة احتياطية"),
+      React.createElement("div", { style: { fontSize: 12.5, color: C.muted, marginBottom: 10 } }, "يصدّر كل بيانات المشتركين والوصولات كملف واحد تقدر تحفظه بتطبيق الملفات أو أي مكان تختاره."),
+      React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 } },
+        React.createElement(PrimaryButton, { onClick: doExport }, "⬇ تصدير نسخة"),
+        React.createElement("label", { style: { ...ghostBtn, cursor: "pointer" } },
+          "⬆ استيراد نسخة",
+          React.createElement("input", { type: "file", accept: "application/json", onChange: doImport, style: { display: "none" } })
+        )
+      ),
+      backupMsg && React.createElement("div", { style: { marginTop: 10, background: backupMsg.ok ? C.successSoft : C.dangerSoft, color: backupMsg.ok ? C.success : C.danger, borderRadius: 10, padding: 12, fontSize: 12.5, fontWeight: 700 } }, backupMsg.msg)
+    ),
+
+    React.createElement("div", { style: { marginTop: 24, paddingTop: 16, borderTop: `1px solid ${C.line}` } },
+      React.createElement("div", { style: { fontWeight: 800, fontSize: 14, marginBottom: 8, color: C.muted } }, "مشاكل بحفظ البيانات؟"),
+      React.createElement("button", { onClick: testStorage, style: { ...ghostBtn, width: "100%" } }, "🔍 اختبار التخزين"),
+      diag && React.createElement("div", { style: { marginTop: 10, background: diag.ok ? C.successSoft : C.dangerSoft, color: diag.ok ? C.success : C.danger, borderRadius: 10, padding: 12, fontSize: 12.5, whiteSpace: "pre-line", fontWeight: 700 } }, diag.msg)
+    )
+  );
+}
+
+
+function BottomNav({ view, setView }) {
+  const items = [["home", "الرئيسية", "🏠"], ["add", "إضافة", "＋"], ["history", "السجل", "🧾"], ["settings", "الإعدادات", "⚙"]];
+  return React.createElement("div", { className: "no-print", style: { position: "fixed", bottom: 0, left: "50%", transform: "translateX(-50%)", width: "100%", maxWidth: 460, background: "#fff", borderTop: `1px solid ${C.line}`, display: "flex", padding: "8px 4px" } },
+    items.map(([key, label, icon]) => React.createElement("button", { key, onClick: () => setView(key), style: { flex: 1, background: "none", border: "none", display: "flex", flexDirection: "column", alignItems: "center", gap: 3, padding: "6px 0", color: view === key ? C.brand : C.muted } },
+      React.createElement("span", { style: { fontSize: 18 } }, icon), React.createElement("span", { style: { fontSize: 10.5, fontWeight: 700 } }, label)
+    ))
+  );
+}
+
+function App() {
+  const [subs, setSubs] = useState(() => loadKey("isp_subscribers", []));
+  const [payments, setPayments] = useState(() => loadKey("isp_payments", []));
+  const [settings, setSettings] = useState(() => loadKey("isp_settings", { companyName: "", companyPhone: "", address: "", currency: "ر.س" }));
+  const [packages, setPackages] = useState(() => loadKey("isp_packages", []));
+  const persistPackages = (next) => { setPackages(next); saveKey("isp_packages", next); };
+  const [view, setViewRaw] = useState("home");
+  const [selected, setSelected] = useState(null);
+  const [receiptData, setReceiptData] = useState(null);
+  const [sheetSub, setSheetSub] = useState(null);
+  const setView = (v) => { setSheetSub(null); setViewRaw(v); };
+
+  const persistSubs = (next) => { setSubs(next); saveKey("isp_subscribers", next); };
+  const persistPayments = (next) => { setPayments(next); saveKey("isp_payments", next); };
+  const persistSettings = (next) => { setSettings(next); saveKey("isp_settings", next); };
+
+  const makeReceipt = (sub, f) => ({ id: genId(), receiptNo: `INV-${String(payments.length + 1).padStart(5, "0")}`, subscriberId: sub.id, subscriberName: sub.name, subscriberPhone: sub.phone, package: f.package, price: f.price, durationMonths: f.durationMonths, startDate: f.startDate, endDate: addMonths(f.startDate, f.durationMonths), createdAt: todayStr() });
+
+  const handleAddSubscriber = (f) => {
+    const sub = { id: genId(), name: f.name, phone: f.phone, address: f.address, package: f.package, price: f.price, durationMonths: f.durationMonths, startDate: f.startDate, endDate: addMonths(f.startDate, f.durationMonths), createdAt: new Date().toISOString() };
+    const receipt = makeReceipt(sub, f);
+    persistSubs([sub, ...subs]); persistPayments([receipt, ...payments]);
+    setReceiptData(receipt); setViewRaw("receipt");
+  };
+  const handleEditSubscriber = (f) => { persistSubs(subs.map((s) => (s.id === selected.id ? { ...s, ...f } : s))); setViewRaw("home"); };
+  const handleRenew = (f) => {
+    const sub = sheetSub || selected; const newEnd = addMonths(f.startDate, f.durationMonths);
+    persistSubs(subs.map((s) => (s.id === sub.id ? { ...s, package: f.package, price: f.price, durationMonths: f.durationMonths, startDate: f.startDate, endDate: newEnd } : s)));
+    const receipt = makeReceipt(sub, f);
+    persistPayments([receipt, ...payments]);
+    setReceiptData(receipt); setViewRaw("receipt");
+  };
+  const handleDelete = (sub) => { persistSubs(subs.filter((s) => s.id !== sub.id)); setSheetSub(null); };
+
+  let title = "المشتركين";
+  if (view === "add") title = "مشترك جديد"; if (view === "edit") title = "تعديل المشترك"; if (view === "renew") title = "تجديد الاشتراك";
+  if (view === "receipt") title = "الوصل"; if (view === "history") title = "سجل الوصولات"; if (view === "settings") title = "الإعدادات"; if (view === "packages") title = "إدارة الباقات";
+
+  return React.createElement("div", { style: { minHeight: "100vh", background: C.paper, display: "flex", justifyContent: "center" } },
+    React.createElement("div", { style: { width: "100%", maxWidth: 460, minHeight: "100vh", position: "relative" } },
+      React.createElement(TopBar, { title, onBack: ["add", "edit", "renew", "receipt", "history", "settings", "packages"].includes(view) ? () => setView(view === "packages" ? "settings" : "home") : null }),
+      view === "home" && React.createElement(HomeScreen, { subs, onOpen: setSheetSub, onAdd: () => setView("add") }),
+      view === "add" && React.createElement(SubscriberForm, { title: "بيانات المشترك والباقة", onSave: handleAddSubscriber, onCancel: () => setView("home"), packages }),
+      view === "edit" && selected && React.createElement(SubscriberForm, { title: "تعديل بيانات المشترك", initial: selected, onSave: handleEditSubscriber, onCancel: () => setView("home"), packages }),
+      view === "renew" && (sheetSub || selected) && React.createElement(RenewForm, { sub: sheetSub || selected, onSave: handleRenew, onCancel: () => setView("home"), packages }),
+      view === "receipt" && React.createElement(ReceiptScreen, { payment: receiptData, settings, onDone: () => setView("home") }),
+      view === "history" && React.createElement(HistoryScreen, { payments, onOpen: (p) => { setReceiptData(p); setViewRaw("receipt"); } }),
+      view === "settings" && React.createElement(SettingsScreen, { settings, onSave: (f) => { persistSettings(f); setView("home"); }, onOpenPackages: () => setViewRaw("packages") }),
+      view === "packages" && React.createElement(PackagesScreen, { packages, onSave: persistPackages }),
+      sheetSub && React.createElement(DetailSheet, { sub: sheetSub, onClose: () => setSheetSub(null), onEdit: (s) => { setSelected(s); setSheetSub(null); setViewRaw("edit"); }, onRenew: (s) => { setSheetSub(s); setViewRaw("renew"); }, onDelete: handleDelete, onReceipt: (s) => { const last = [...payments].filter((p) => p.subscriberId === s.id).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0]; if (last) { setReceiptData(last); setViewRaw("receipt"); } setSheetSub(null); } }),
+      view !== "receipt" && React.createElement(BottomNav, { view, setView })
+    )
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+</script>
+</body>
+</html>
