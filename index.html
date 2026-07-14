@@ -1,0 +1,1262 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>SpicyWiFi Management</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+<script src="https://unpkg.com/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;900&family=IBM+Plex+Mono:wght@500;600&display=swap');
+* { font-family: 'Tajawal', sans-serif; box-sizing: border-box; margin:0; padding:0; }
+.mono { font-family: 'IBM Plex Mono', monospace; direction: ltr; unicode-bidi: plaintext; }
+body { background:#F3F6F5; }
+@media print {
+  body * { visibility: hidden; }
+  #print-receipt, #print-receipt * { visibility: visible; }
+  #print-receipt { position: absolute; inset: 0; width: 100%; }
+}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useMemo, useCallback } = React;
+
+/* ---------------- design tokens / themes ---------------- */
+const THEMES = {
+  light: {
+    paper: "#F3F6F5", surface: "#FFFFFF", ink: "#122024", muted: "#657379", line: "#E2E8E7",
+    brand: "#0E3B43", brandSoft: "#DCEBEA", accent: "#17B6C4",
+    success: "#2F9E6E", successSoft: "#E3F5EC",
+    warning: "#C98A1E", warningSoft: "#FBEED9",
+    danger: "#D14343", dangerSoft: "#FAE1E1",
+  },
+  dark: {
+    paper: "#0B1416", surface: "#122226", ink: "#EAF2F1", muted: "#8CA3A8", line: "#1F3339",
+    brand: "#12474F", brandSoft: "#1B3A3F", accent: "#22D3E6",
+    success: "#3ABE85", successSoft: "#173A2C",
+    warning: "#E0AC3F", warningSoft: "#3A2F14",
+    danger: "#E36767", dangerSoft: "#3A1B1B",
+  },
+};
+const C = { ...THEMES[loadKeySafe("isp_theme", "light")] };
+function loadKeySafe(key, fallback) { try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; } catch { return fallback; } }
+function applyTheme(name) { Object.assign(C, THEMES[name] || THEMES.light); }
+
+const genId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+const addMonths = (dateStr, months) => { const d = new Date(dateStr); d.setMonth(d.getMonth() + Number(months)); return d.toISOString().slice(0, 10); };
+const todayStr = () => new Date().toISOString().slice(0, 10);
+const fmtDate = (dateStr) => { if (!dateStr) return "—"; const d = new Date(dateStr); return d.toLocaleDateString("ar-EG-u-nu-latn", { year: "numeric", month: "long", day: "numeric" }); };
+const daysRemaining = (endDate) => { const end = new Date(endDate); const now = new Date(todayStr()); return Math.round((end - now) / 86400000); };
+const getStatus = (endDate) => { const d = daysRemaining(endDate); if (d < 0) return { key: "expired", label: "منتهي", color: C.danger, soft: C.dangerSoft }; if (d <= 5) return { key: "soon", label: "قريب الانتهاء", color: C.warning, soft: C.warningSoft }; return { key: "active", label: "نشط", color: C.success, soft: C.successSoft }; };
+
+/* ---------------- local storage (data on the phone only) ---------------- */
+function loadKey(key, fallback) { try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; } catch (e) { console.error("loadKey failed", key, e); return fallback; } }
+function saveKey(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+    return true;
+  } catch (e) {
+    console.error("saveKey failed", key, e);
+    alert("⚠️ ما قدر يحفظ البيانات على هذا الجهاز/المتصفح. جرّب تفتح الملف من متصفح Chrome عادي (مو من واتساب أو تطبيق ملفات مباشرة) أو فعّل تخزين الموقع (Site Data) من إعدادات المتصفح.");
+    return false;
+  }
+}
+
+
+/* ---------------- backup to file ---------------- */
+async function exportBackupFile() {
+  const payload = {
+    subscribers: loadKey("isp_subscribers", []),
+    payments: loadKey("isp_payments", []),
+    settings: loadKey("isp_settings", {}),
+    packages: loadKey("isp_packages", []),
+    savedAt: new Date().toISOString(),
+  };
+  const json = JSON.stringify(payload, null, 2);
+  const stamp = new Date().toISOString().slice(0, 10);
+  const filename = `spicywifi-backup-${stamp}.json`;
+  if (isNativeApp()) {
+    const blob = new Blob([json], { type: "application/json" });
+    const uri = await nativeSaveFile(blob, filename);
+    return { ok: true, msg: `تم حفظ الملف باسم ${filename} داخل مجلد Documents الخاص بالتطبيق ✅`, uri };
+  }
+  const blob = new Blob([json], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+  return { ok: true, msg: "تم تنزيل ملف النسخة الاحتياطية ✅" };
+}
+function importBackupFile(file, onDone) {
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const data = JSON.parse(e.target.result);
+      saveKey("isp_subscribers", data.subscribers || []);
+      saveKey("isp_payments", data.payments || []);
+      saveKey("isp_settings", data.settings || {});
+      saveKey("isp_packages", data.packages || []);
+      onDone(true);
+    } catch (err) {
+      onDone(false, err.message);
+    }
+  };
+  reader.onerror = () => onDone(false, "تعذرت قراءة الملف");
+  reader.readAsText(file);
+}
+
+function SignalBars({ endDate, size }) {
+  const d = daysRemaining(endDate);
+  let filled = d > 15 ? 4 : d > 7 ? 3 : d > 0 ? 2 : d === 0 ? 1 : 0;
+  const status = getStatus(endDate);
+  const h = size === "sm" ? [5, 8, 11, 14] : [7, 11, 15, 19];
+  return React.createElement("div", { style: { display: "flex", alignItems: "flex-end", gap: 2, height: h[3] } },
+    h.map((barH, i) => React.createElement("div", { key: i, style: { width: size === "sm" ? 3 : 4, height: barH, borderRadius: 2, background: i < filled ? status.color : C.line } }))
+  );
+}
+function Badge({ status }) {
+  return React.createElement("span", { style: { background: status.soft, color: status.color, fontSize: 12, fontWeight: 700, padding: "3px 10px", borderRadius: 999, whiteSpace: "nowrap" } }, status.label);
+}
+function TopBar({ title, onBack }) {
+  return React.createElement("div", { className: "no-print", style: { background: `linear-gradient(135deg, ${C.brand} 0%, #0A2E34 100%)`, color: "#fff", padding: "18px 16px", display: "flex", alignItems: "center", gap: 12, boxShadow: "0 4px 14px rgba(14,59,67,.25)" } },
+    onBack && React.createElement("button", { onClick: onBack, style: { background: "rgba(255,255,255,.14)", border: "none", color: "#fff", borderRadius: 10, padding: 8, display: "flex" } }, "→"),
+    !onBack && React.createElement("div", { style: { background: C.accent, borderRadius: 11, width: 38, height: 38, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 900, fontSize: 17, color: C.brand, boxShadow: "0 2px 6px rgba(0,0,0,.2)" } }, "S"),
+    onBack
+      ? React.createElement("span", { style: { fontWeight: 900, fontSize: 17 } }, title)
+      : React.createElement("div", null,
+          React.createElement("div", { style: { fontWeight: 900, fontSize: 17, letterSpacing: .2 } }, "SpicyWiFi ", React.createElement("span", { style: { color: C.accent } }, "Management")),
+          React.createElement("div", { style: { fontSize: 11.5, color: "rgba(255,255,255,.65)", marginTop: 1 } }, "لوحة إدارة مشتركين الإنترنت")
+        )
+  );
+}
+function Field({ label, children }) {
+  return React.createElement("label", { style: { display: "block", marginBottom: 14 } },
+    React.createElement("div", { style: { fontSize: 13, fontWeight: 700, color: C.muted, marginBottom: 6 } }, label), children);
+}
+const inputStyle = () => ({ width: "100%", padding: "11px 12px", borderRadius: 10, border: `1.5px solid ${C.line}`, fontSize: 15, color: C.ink, background: C.surface, outline: "none" });
+function PrimaryButton({ children, onClick, full, disabled }) {
+  return React.createElement("button", { onClick, disabled, style: { background: disabled ? C.line : C.brand, color: disabled ? C.muted : "#fff", border: "none", borderRadius: 12, padding: "13px 18px", fontWeight: 700, fontSize: 15, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: full ? "100%" : "auto", cursor: disabled ? "not-allowed" : "pointer" } }, children);
+}
+const ghostBtn = () => ({ border: `1.5px solid ${C.line}`, background: C.surface, color: C.ink, borderRadius: 12, padding: "12px 10px", fontWeight: 700, fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, cursor: "pointer" });
+
+function StatTile({ label, value, color }) {
+  return React.createElement("div", { style: { flex: 1, background: C.surface, borderRadius: 14, padding: "12px 10px", textAlign: "center", boxShadow: "0 1px 3px rgba(18,32,36,.06)", border: `1px solid ${C.line}` } },
+    React.createElement("div", { className: "mono", style: { fontSize: 20, fontWeight: 800, color: color || C.ink } }, value),
+    React.createElement("div", { style: { fontSize: 11, color: C.muted, marginTop: 2, fontWeight: 700 } }, label)
+  );
+}
+
+function HomeScreen({ subs, onOpen, onAdd }) {
+  const [q, setQ] = useState(""); const [filter, setFilter] = useState("all");
+  const counts = useMemo(() => { const c = { all: subs.length, active: 0, soon: 0, expired: 0, debt: 0 }; subs.forEach((s) => { c[getStatus(s.endDate).key] += 1; if (s.debt > 0) c.debt += 1; }); return c; }, [subs]);
+  const filtered = subs.filter((s) => (filter === "all" ? true : filter === "debt" ? s.debt > 0 : getStatus(s.endDate).key === filter))
+    .filter((s) => (s.name + s.phone).toLowerCase().includes(q.toLowerCase()))
+    .sort((a, b) => daysRemaining(a.endDate) - daysRemaining(b.endDate));
+  const chips = [{ key: "all", label: `الكل (${counts.all})` }, { key: "active", label: `نشط (${counts.active})` }, { key: "soon", label: `قريب الانتهاء (${counts.soon})` }, { key: "expired", label: `منتهي (${counts.expired})` }, { key: "debt", label: `عليهم دين (${counts.debt})` }];
+  return React.createElement("div", { style: { paddingBottom: 90 } },
+    React.createElement("div", { style: { padding: "14px 14px 0" } },
+      React.createElement("div", { style: { display: "flex", gap: 8, marginBottom: 14 } },
+        React.createElement(StatTile, { label: "الكل", value: counts.all }),
+        React.createElement(StatTile, { label: "نشط", value: counts.active, color: C.success }),
+        React.createElement(StatTile, { label: "قريب الانتهاء", value: counts.soon, color: C.warning }),
+        React.createElement(StatTile, { label: "منتهي", value: counts.expired, color: C.danger })
+      )
+    ),
+    React.createElement("div", { style: { padding: 14 } },
+      React.createElement("input", { placeholder: "بحث بالاسم أو رقم الهاتف", value: q, onChange: (e) => setQ(e.target.value), style: { ...inputStyle(), marginBottom: 12 } }),
+      React.createElement("div", { style: { display: "flex", gap: 8, overflowX: "auto" } },
+        chips.map((c) => React.createElement("button", { key: c.key, onClick: () => setFilter(c.key), style: { flexShrink: 0, padding: "7px 14px", borderRadius: 999, border: `1.5px solid ${filter === c.key ? C.brand : C.line}`, background: filter === c.key ? C.brand : "#fff", color: filter === c.key ? "#fff" : C.ink, fontSize: 13, fontWeight: 700 } }, c.label))
+      )
+    ),
+    React.createElement("div", { style: { padding: "0 14px", display: "flex", flexDirection: "column", gap: 10 } },
+      filtered.length === 0 && React.createElement("div", { style: { textAlign: "center", color: C.muted, padding: "40px 10px" } }, "ما فيه مشتركين. اضغط + بالأسفل"),
+      filtered.map((s) => {
+        const status = getStatus(s.endDate); const d = daysRemaining(s.endDate);
+        return React.createElement("div", { key: s.id, onClick: () => onOpen(s), style: { background: C.surface, borderRadius: 14, padding: 14, border: `1px solid ${C.line}`, boxShadow: "0 1px 3px rgba(18,32,36,.06)", cursor: "pointer" } },
+          React.createElement("div", { style: { display: "flex", justifyContent: "space-between" } },
+            React.createElement("div", null,
+              React.createElement("div", { style: { fontWeight: 800, fontSize: 15.5 } }, s.name),
+              React.createElement("div", { className: "mono", style: { fontSize: 12.5, color: C.muted } }, s.phone)
+            ),
+            React.createElement("div", { style: { display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 5 } },
+              React.createElement(Badge, { status }),
+              s.debt > 0 && React.createElement("span", { className: "mono", style: { fontSize: 11, fontWeight: 800, color: C.danger, background: C.dangerSoft, padding: "2px 8px", borderRadius: 999 } }, `دين: ${s.debt}`)
+            )
+          ),
+          React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 12 } },
+            React.createElement("div", { style: { fontSize: 12.5, color: C.muted } }, s.package, " · ", React.createElement("span", { className: "mono" }, s.price)),
+            React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
+              React.createElement("span", { style: { fontSize: 12, fontWeight: 700, color: status.color } }, d >= 0 ? `${d} يوم متبقي` : `متأخر ${Math.abs(d)} يوم`),
+              React.createElement(SignalBars, { endDate: s.endDate, size: "sm" })
+            )
+          )
+        );
+      })
+    ),
+    React.createElement("button", { onClick: onAdd, className: "no-print", style: { position: "fixed", bottom: 84, left: "50%", transform: "translateX(calc(-50% + 190px))", background: C.accent, color: C.brand, border: "none", borderRadius: 999, width: 54, height: 54, fontSize: 24, boxShadow: "0 6px 16px rgba(14,59,67,.3)" } }, "＋")
+  );
+}
+
+function SubscriberForm({ initial, onSave, onCancel, title, packages }) {
+  const [f, setF] = useState(initial || { name: "", phone: "", address: "", package: "", price: "", durationMonths: 1, startDate: todayStr(), paymentType: "cash", amountPaid: "" });
+  const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
+  const valid = f.name.trim() && f.phone.trim() && f.package.trim() && f.price !== "";
+  const pickPackage = (pkgName) => {
+    const pkg = (packages || []).find((p) => p.name === pkgName);
+    setF((p) => ({ ...p, package: pkgName, price: pkg && pkg.price !== "" ? pkg.price : p.price }));
+  };
+  const remaining = f.paymentType === "credit" ? Math.max(0, Number(f.price || 0) - Number(f.amountPaid || 0)) : 0;
+  return React.createElement("div", { style: { padding: 16, paddingBottom: 100 } },
+    React.createElement("div", { style: { fontWeight: 800, fontSize: 15, marginBottom: 14, color: C.muted } }, title),
+    React.createElement(Field, { label: "اسم المشترك *" }, React.createElement("input", { style: inputStyle(), value: f.name, onChange: (e) => set("name", e.target.value) })),
+    React.createElement(Field, { label: "رقم الهاتف *" }, React.createElement("input", { style: inputStyle(), className: "mono", dir: "ltr", value: f.phone, onChange: (e) => set("phone", e.target.value) })),
+    React.createElement(Field, { label: "العنوان (اختياري)" }, React.createElement("input", { style: inputStyle(), value: f.address, onChange: (e) => set("address", e.target.value) })),
+    React.createElement(Field, { label: "الباقة *" },
+      React.createElement("input", { style: inputStyle(), list: "pkg-list", value: f.package, onChange: (e) => pickPackage(e.target.value) }),
+      React.createElement("datalist", { id: "pkg-list" }, (packages || []).map((p) => React.createElement("option", { key: p.id, value: p.name })))
+    ),
+    React.createElement("div", { style: { display: "flex", gap: 10 } },
+      React.createElement("div", { style: { flex: 1 } }, React.createElement(Field, { label: "السعر *" }, React.createElement("input", { style: inputStyle(), className: "mono", dir: "ltr", type: "number", value: f.price, onChange: (e) => set("price", e.target.value) }))),
+      React.createElement("div", { style: { flex: 1 } }, React.createElement(Field, { label: "المدة (أشهر) *" }, React.createElement("select", { style: inputStyle(), value: f.durationMonths, onChange: (e) => set("durationMonths", e.target.value) }, [1, 2, 3, 6, 12].map((m) => React.createElement("option", { key: m, value: m }, `${m} شهر`)))))
+    ),
+    React.createElement(Field, { label: "تاريخ بداية الاشتراك" }, React.createElement("input", { style: inputStyle(), type: "date", value: f.startDate, onChange: (e) => set("startDate", e.target.value) })),
+    React.createElement(Field, { label: "طريقة الدفع" },
+      React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 } },
+        React.createElement("button", { type: "button", onClick: () => set("paymentType", "cash"), style: { padding: "11px 12px", borderRadius: 10, border: `1.5px solid ${f.paymentType === "cash" ? C.brand : C.line}`, background: f.paymentType === "cash" ? C.brand : "#fff", color: f.paymentType === "cash" ? "#fff" : C.ink, fontWeight: 700 } }, "💵 نقد"),
+        React.createElement("button", { type: "button", onClick: () => set("paymentType", "credit"), style: { padding: "11px 12px", borderRadius: 10, border: `1.5px solid ${f.paymentType === "credit" ? C.brand : C.line}`, background: f.paymentType === "credit" ? C.brand : "#fff", color: f.paymentType === "credit" ? "#fff" : C.ink, fontWeight: 700 } }, "📒 آجل (دين)")
+      )
+    ),
+    f.paymentType === "credit" && React.createElement(Field, { label: "المبلغ المدفوع الآن (اتركه فارغًا لو ما دفع شي)" },
+      React.createElement("input", { style: inputStyle(), className: "mono", dir: "ltr", type: "number", value: f.amountPaid, onChange: (e) => set("amountPaid", e.target.value) })
+    ),
+    f.paymentType === "credit" && remaining > 0 && React.createElement("div", { style: { background: C.dangerSoft, color: C.danger, borderRadius: 10, padding: 12, marginBottom: 14, fontSize: 13, fontWeight: 700 } }, `سيُسجَّل دين متبقي: ${remaining}`),
+    React.createElement(PrimaryButton, { full: true, disabled: !valid, onClick: () => onSave(f) }, "حفظ وتفعيل"),
+    React.createElement("button", { onClick: onCancel, style: { width: "100%", marginTop: 10, background: "none", border: "none", color: C.muted, fontWeight: 700, padding: 10 } }, "إلغاء")
+  );
+}
+
+function DetailSheet({ sub, onClose, onEdit, onRenew, onDelete, onReceipt, onPayDebt }) {
+  const status = getStatus(sub.endDate); const d = daysRemaining(sub.endDate);
+  return React.createElement("div", { style: { position: "fixed", inset: 0, background: "rgba(10,20,22,.45)", display: "flex", alignItems: "flex-end", zIndex: 40 }, onClick: onClose },
+    React.createElement("div", { onClick: (e) => e.stopPropagation(), style: { background: "#fff", width: "100%", maxWidth: 460, margin: "0 auto", borderRadius: "20px 20px 0 0", padding: 20, maxHeight: "82vh", overflowY: "auto" } },
+      React.createElement("div", { style: { width: 40, height: 4, background: C.line, borderRadius: 4, margin: "0 auto 16px" } }),
+      React.createElement("div", { style: { display: "flex", justifyContent: "space-between" } }, React.createElement("div", { style: { fontWeight: 900, fontSize: 19 } }, sub.name), React.createElement(Badge, { status })),
+      React.createElement("div", { className: "mono", style: { color: C.muted, fontSize: 13, marginBottom: 18 } }, sub.phone),
+      React.createElement("div", { style: { background: C.paper, borderRadius: 14, padding: 14, display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: sub.debt > 0 ? 10 : 18 } },
+        React.createElement("div", null,
+          React.createElement("div", { style: { fontSize: 12, color: C.muted } }, "الباقة"),
+          React.createElement("div", { style: { fontWeight: 800 } }, sub.package, " · ", React.createElement("span", { className: "mono" }, sub.price)),
+          React.createElement("div", { style: { fontSize: 12, color: C.muted, marginTop: 8 } }, fmtDate(sub.startDate), " ← ", fmtDate(sub.endDate))
+        ),
+        React.createElement("div", { style: { textAlign: "center" } }, React.createElement(SignalBars, { endDate: sub.endDate }), React.createElement("div", { style: { fontSize: 11, fontWeight: 700, color: status.color, marginTop: 4 } }, d >= 0 ? `${d} يوم` : `متأخر ${Math.abs(d)}`))
+      ),
+      sub.debt > 0 && React.createElement("div", { style: { background: C.dangerSoft, borderRadius: 12, padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18 } },
+        React.createElement("span", { style: { color: C.danger, fontWeight: 800, fontSize: 13.5 } }, "📒 دين متبقي"),
+        React.createElement("span", { className: "mono", style: { color: C.danger, fontWeight: 900, fontSize: 16 } }, sub.debt)
+      ),
+      React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 } },
+        React.createElement(PrimaryButton, { onClick: () => onRenew(sub) }, "↻ تجديد الاشتراك"),
+        sub.debt > 0
+          ? React.createElement("button", { onClick: () => onPayDebt(sub), style: { ...ghostBtn(), color: C.danger, borderColor: C.dangerSoft } }, "💰 تسديد دين")
+          : React.createElement("button", { onClick: () => onReceipt(sub), style: ghostBtn() }, "🖨 آخر وصل"),
+        React.createElement("button", { onClick: () => onEdit(sub), style: ghostBtn() }, "✏ تعديل البيانات"),
+        React.createElement("button", { onClick: () => onDelete(sub), style: { ...ghostBtn(), color: C.danger } }, "🗑 حذف")
+      )
+    )
+  );
+}
+
+function RenewForm({ sub, onSave, onCancel, packages }) {
+  const base = daysRemaining(sub.endDate) > 0 ? sub.endDate : todayStr();
+  const [f, setF] = useState({ package: sub.package, price: sub.price, durationMonths: 1, startDate: base, paymentType: "cash", amountPaid: "" });
+  const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
+  const pickPackage = (pkgName) => {
+    const pkg = (packages || []).find((p) => p.name === pkgName);
+    setF((p) => ({ ...p, package: pkgName, price: pkg && pkg.price !== "" ? pkg.price : p.price }));
+  };
+  const newEnd = addMonths(f.startDate, f.durationMonths);
+  const remaining = f.paymentType === "credit" ? Math.max(0, Number(f.price || 0) - Number(f.amountPaid || 0)) : 0;
+  return React.createElement("div", { style: { padding: 16, paddingBottom: 100 } },
+    React.createElement("div", { style: { fontWeight: 800 } }, "تجديد اشتراك: ", sub.name),
+    sub.debt > 0 && React.createElement("div", { className: "mono", style: { fontSize: 13, color: C.danger, fontWeight: 700, marginTop: 4 } }, `دين سابق مستحق: ${sub.debt}`),
+    React.createElement("div", { style: { fontSize: 13, color: C.muted, marginBottom: 16 } }, "الانتهاء الحالي: ", fmtDate(sub.endDate)),
+    React.createElement(Field, { label: "الباقة" },
+      React.createElement("input", { style: inputStyle(), list: "pkg-list-renew", value: f.package, onChange: (e) => pickPackage(e.target.value) }),
+      React.createElement("datalist", { id: "pkg-list-renew" }, (packages || []).map((p) => React.createElement("option", { key: p.id, value: p.name })))
+    ),
+    React.createElement("div", { style: { display: "flex", gap: 10 } },
+      React.createElement("div", { style: { flex: 1 } }, React.createElement(Field, { label: "السعر" }, React.createElement("input", { style: inputStyle(), className: "mono", dir: "ltr", type: "number", value: f.price, onChange: (e) => set("price", e.target.value) }))),
+      React.createElement("div", { style: { flex: 1 } }, React.createElement(Field, { label: "مدة التجديد" }, React.createElement("select", { style: inputStyle(), value: f.durationMonths, onChange: (e) => set("durationMonths", e.target.value) }, [1, 2, 3, 6, 12].map((m) => React.createElement("option", { key: m, value: m }, `${m} شهر`)))))
+    ),
+    React.createElement(Field, { label: "يبدأ من" }, React.createElement("input", { style: inputStyle(), type: "date", value: f.startDate, onChange: (e) => set("startDate", e.target.value) })),
+    React.createElement(Field, { label: "طريقة الدفع" },
+      React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 } },
+        React.createElement("button", { type: "button", onClick: () => set("paymentType", "cash"), style: { padding: "11px 12px", borderRadius: 10, border: `1.5px solid ${f.paymentType === "cash" ? C.brand : C.line}`, background: f.paymentType === "cash" ? C.brand : "#fff", color: f.paymentType === "cash" ? "#fff" : C.ink, fontWeight: 700 } }, "💵 نقد"),
+        React.createElement("button", { type: "button", onClick: () => set("paymentType", "credit"), style: { padding: "11px 12px", borderRadius: 10, border: `1.5px solid ${f.paymentType === "credit" ? C.brand : C.line}`, background: f.paymentType === "credit" ? C.brand : "#fff", color: f.paymentType === "credit" ? "#fff" : C.ink, fontWeight: 700 } }, "📒 آجل (دين)")
+      )
+    ),
+    f.paymentType === "credit" && React.createElement(Field, { label: "المبلغ المدفوع الآن (اتركه فارغًا لو ما دفع شي)" },
+      React.createElement("input", { style: inputStyle(), className: "mono", dir: "ltr", type: "number", value: f.amountPaid, onChange: (e) => set("amountPaid", e.target.value) })
+    ),
+    f.paymentType === "credit" && remaining > 0 && React.createElement("div", { style: { background: C.dangerSoft, color: C.danger, borderRadius: 10, padding: 12, marginBottom: 14, fontSize: 13, fontWeight: 700 } }, `سيُضاف دين جديد: ${remaining}`),
+    React.createElement("div", { style: { background: C.brandSoft, borderRadius: 12, padding: 12, marginBottom: 16, fontSize: 13.5, fontWeight: 700, color: C.brand } }, "ينتهي في: ", fmtDate(newEnd)),
+    React.createElement(PrimaryButton, { full: true, onClick: () => onSave(f) }, "تأكيد وطباعة الوصل"),
+    React.createElement("button", { onClick: onCancel, style: { width: "100%", marginTop: 10, background: "none", border: "none", color: C.muted, fontWeight: 700, padding: 10 } }, "إلغاء")
+  );
+}
+
+function DebtPaymentForm({ sub, onSave, onCancel }) {
+  const [amount, setAmount] = useState("");
+  const num = Number(amount || 0);
+  const valid = num > 0 && num <= sub.debt;
+  return React.createElement("div", { style: { padding: 16, paddingBottom: 100 } },
+    React.createElement("div", { style: { fontWeight: 800 } }, "تسديد دين: ", sub.name),
+    React.createElement("div", { style: { background: C.dangerSoft, borderRadius: 12, padding: 14, margin: "14px 0", display: "flex", justifyContent: "space-between", alignItems: "center" } },
+      React.createElement("span", { style: { color: C.danger, fontWeight: 700 } }, "الدين الحالي"),
+      React.createElement("span", { className: "mono", style: { color: C.danger, fontWeight: 900, fontSize: 18 } }, sub.debt)
+    ),
+    React.createElement(Field, { label: "المبلغ المسدَّد الآن *" },
+      React.createElement("input", { style: inputStyle(), className: "mono", dir: "ltr", type: "number", value: amount, onChange: (e) => setAmount(e.target.value), placeholder: `أقصى مبلغ: ${sub.debt}` })
+    ),
+    num > sub.debt && React.createElement("div", { style: { color: C.danger, fontSize: 12.5, fontWeight: 700, marginBottom: 10 } }, "المبلغ أكبر من الدين المستحق"),
+    React.createElement("div", { style: { background: C.brandSoft, borderRadius: 12, padding: 12, marginBottom: 16, fontSize: 13.5, fontWeight: 700, color: C.brand } }, "الدين المتبقي بعد التسديد: ", Math.max(0, sub.debt - num)),
+    React.createElement(PrimaryButton, { full: true, disabled: !valid, onClick: () => onSave(num) }, "✔ تأكيد التسديد"),
+    React.createElement("button", { onClick: onCancel, style: { width: "100%", marginTop: 10, background: "none", border: "none", color: C.muted, fontWeight: 700, padding: 10 } }, "إلغاء")
+  );
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result.split(",")[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+function isNativeApp() {
+  return !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+}
+async function nativeSaveFile(blob, filename) {
+  const { Filesystem } = window.Capacitor.Plugins;
+  const base64Data = await blobToBase64(blob);
+  const result = await Filesystem.writeFile({ path: filename, data: base64Data, directory: "DOCUMENTS", recursive: true });
+  return result.uri;
+}
+async function nativeShareFile(uri, title, text) {
+  const { Share } = window.Capacitor.Plugins;
+  await Share.share({ title, text, url: uri, dialogTitle: "مشاركة الوصل" });
+}
+
+function ReceiptScreen({ payment, settings, onDone }) {
+  if (!payment) return null;
+  const [busy, setBusy] = useState(false);
+  const rows = [["المشترك", payment.subscriberName], ["رقم الهاتف", payment.subscriberPhone], ["الباقة", payment.package], ["المدة", `${payment.durationMonths} شهر`], ["تاريخ البداية", fmtDate(payment.startDate)], ["تاريخ الانتهاء", fmtDate(payment.endDate)]];
+  if (payment.paymentType === "credit") rows.push(["حالة الدفع", payment.remaining > 0 ? `آجل — متبقي ${payment.remaining}` : "آجل — تم السداد بالكامل"]);
+  const captureCanvas = async () => {
+    const el = document.getElementById("print-receipt");
+    return await html2canvas(el, { scale: 2, backgroundColor: "#ffffff" });
+  };
+  const downloadPDF = async () => {
+    setBusy(true);
+    try {
+      const canvas = await captureCanvas();
+      const imgData = canvas.toDataURL("image/png");
+      const { jsPDF } = window.jspdf;
+      const w = canvas.width / 2, h = canvas.height / 2;
+      const pdf = new jsPDF({ unit: "pt", format: [w, h] });
+      pdf.addImage(imgData, "PNG", 0, 0, w, h);
+      const filename = `وصل-${payment.receiptNo}.pdf`;
+      if (isNativeApp()) {
+        const blob = pdf.output("blob");
+        await nativeSaveFile(blob, filename);
+        alert("تم حفظ ملف PDF في مجلد Documents الخاص بالتطبيق ✅");
+      } else {
+        pdf.save(filename);
+      }
+    } catch (e) {
+      alert("تعذر إنشاء ملف PDF: " + e.message);
+      console.error(e);
+    }
+    setBusy(false);
+  };
+  const saveImage = async () => {
+    setBusy(true);
+    try {
+      const canvas = await captureCanvas();
+      canvas.toBlob(async (blob) => {
+        const filename = `وصل-${payment.receiptNo}.png`;
+        if (isNativeApp()) {
+          await nativeSaveFile(blob, filename);
+          alert("تم حفظ الصورة في مجلد Documents الخاص بالتطبيق ✅");
+        } else {
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url; a.download = filename;
+          document.body.appendChild(a); a.click(); a.remove();
+          URL.revokeObjectURL(url);
+        }
+        setBusy(false);
+      }, "image/png");
+    } catch (e) {
+      alert("تعذر إنشاء الصورة: " + e.message);
+      console.error(e);
+      setBusy(false);
+    }
+  };
+  const shareReceipt = async () => {
+    setBusy(true);
+    try {
+      const canvas = await captureCanvas();
+      canvas.toBlob(async (blob) => {
+        const filename = `وصل-${payment.receiptNo}.png`;
+        try {
+          if (isNativeApp()) {
+            const uri = await nativeSaveFile(blob, filename);
+            await nativeShareFile(uri, "وصل الاشتراك", `وصل اشتراك ${payment.subscriberName}`);
+          } else {
+            const file = new File([blob], filename, { type: "image/png" });
+            if (navigator.canShare && navigator.canShare({ files: [file] })) {
+              await navigator.share({ files: [file], title: "وصل الاشتراك", text: `وصل اشتراك ${payment.subscriberName}` });
+            } else {
+              alert("متصفحك لا يدعم المشاركة المباشرة، سيتم تنزيل الصورة لإرسالها يدويًا");
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement("a");
+              a.href = url; a.download = filename;
+              document.body.appendChild(a); a.click(); a.remove();
+              URL.revokeObjectURL(url);
+            }
+          }
+        } catch (err) {
+          console.error(err);
+        }
+        setBusy(false);
+      }, "image/png");
+    } catch (e) {
+      console.error(e);
+      setBusy(false);
+    }
+  };
+  return React.createElement("div", { style: { padding: 16 } },
+    React.createElement("div", { id: "print-receipt", style: { background: "#fff", border: `1.5px solid ${C.line}`, borderRadius: 16, padding: 22, maxWidth: 420, margin: "0 auto" } },
+      React.createElement("div", { style: { textAlign: "center", marginBottom: 16, paddingBottom: 16, borderBottom: `1.5px dashed ${C.line}` } },
+        settings.logoDataUrl
+          ? React.createElement("img", { src: settings.logoDataUrl, style: { maxHeight: 60, maxWidth: 180, margin: "0 auto 8px", display: "block" } })
+          : React.createElement("div", { style: { display: "inline-flex", background: C.brand, padding: 10, borderRadius: 12, marginBottom: 8 } }, React.createElement("span", { style: { fontSize: 18 } }, "📶")),
+        React.createElement("div", { style: { fontWeight: 900, fontSize: 17 } }, settings.companyName || "اسم الشركة"),
+        settings.companyPhone && React.createElement("div", { className: "mono", style: { fontSize: 12.5, color: C.muted } }, settings.companyPhone)
+      ),
+      React.createElement("div", { style: { display: "flex", justifyContent: "space-between", fontSize: 12.5, color: C.muted, marginBottom: 14 } },
+        React.createElement("span", null, "رقم الوصل: ", React.createElement("b", { className: "mono" }, payment.receiptNo)),
+        React.createElement("span", { className: "mono" }, fmtDate(payment.createdAt))
+      ),
+      React.createElement("table", { style: { width: "100%", fontSize: 13.5, borderCollapse: "collapse" } },
+        React.createElement("tbody", null, rows.map(([k, v]) => React.createElement("tr", { key: k }, React.createElement("td", { style: { padding: "8px 0", color: C.muted } }, k), React.createElement("td", { style: { padding: "8px 0", fontWeight: 700, textAlign: "left" } }, v))))
+      ),
+      React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 16, paddingTop: 14, borderTop: `1.5px dashed ${C.line}` } },
+        React.createElement("span", { style: { fontWeight: 800 } }, "المبلغ المدفوع"),
+        React.createElement("span", { className: "mono", style: { fontWeight: 900, fontSize: 20, color: C.brand } }, `${payment.price} ${settings.currency || ""}`)
+      )
+    ),
+    React.createElement("div", { className: "no-print", style: { maxWidth: 420, margin: "18px auto 0", display: "flex", flexDirection: "column", gap: 10 } },
+      React.createElement(PrimaryButton, { full: true, disabled: busy, onClick: shareReceipt }, busy ? "جاري التجهيز..." : "📤 مشاركة الوصل (واتساب/ماسنجر)"),
+      React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 } },
+        React.createElement("button", { disabled: busy, onClick: saveImage, style: ghostBtn() }, "🖼 حفظ كصورة"),
+        React.createElement("button", { disabled: busy, onClick: downloadPDF, style: ghostBtn() }, "⬇ حفظ PDF")
+      ),
+      React.createElement("button", { onClick: () => window.print(), style: ghostBtn() }, "🖨 طباعة مباشرة")
+    ),
+    React.createElement("button", { className: "no-print", onClick: onDone, style: { width: "100%", marginTop: 10, background: "none", border: "none", color: C.muted, fontWeight: 700, padding: 10 } }, "رجوع للرئيسية")
+  );
+}
+
+function HistoryScreen({ payments, debtPayments, subs, onOpen }) {
+  const sorted = [...payments].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  const totalCollected = payments.reduce((s, p) => s + Number(p.amountPaid != null ? p.amountPaid : p.price || 0), 0) + (debtPayments || []).reduce((s, d) => s + Number(d.amount || 0), 0);
+  const totalDebt = (subs || []).reduce((s, sub) => s + Number(sub.debt || 0), 0);
+  return React.createElement("div", { style: { padding: 14, paddingBottom: 90 } },
+    React.createElement("div", { style: { display: "flex", gap: 8, marginBottom: 16 } },
+      React.createElement(StatTile, { label: "إجمالي المقبوضات", value: totalCollected, color: C.success }),
+      React.createElement(StatTile, { label: "إجمالي الديون المستحقة", value: totalDebt, color: totalDebt > 0 ? C.danger : C.muted })
+    ),
+    sorted.length === 0 && React.createElement("div", { style: { textAlign: "center", color: C.muted, padding: "50px 10px" } }, "ما فيه وصولات لسه"),
+    React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 10 } },
+      sorted.map((p) => React.createElement("div", { key: p.id, onClick: () => onOpen(p), style: { background: C.surface, border: `1px solid ${C.line}`, borderRadius: 14, padding: 14, cursor: "pointer", display: "flex", justifyContent: "space-between" } },
+        React.createElement("div", null,
+          React.createElement("div", { style: { fontWeight: 800, fontSize: 14.5 } }, p.subscriberName),
+          React.createElement("div", { style: { fontSize: 12, color: C.muted } }, p.package, " · ", React.createElement("span", { className: "mono" }, fmtDate(p.createdAt))),
+          p.paymentType === "credit" && p.remaining > 0 && React.createElement("div", { style: { fontSize: 11.5, color: C.danger, fontWeight: 700, marginTop: 3 } }, "📒 آجل — دين: ", React.createElement("span", { className: "mono" }, p.remaining))
+        ),
+        React.createElement("div", { style: { textAlign: "left" } }, React.createElement("div", { className: "mono", style: { fontWeight: 800, color: C.brand } }, p.price), React.createElement("div", { className: "mono", style: { fontSize: 11, color: C.muted } }, p.receiptNo))
+      )),
+      (debtPayments || []).slice().reverse().map((d) => React.createElement("div", { key: d.id, style: { background: C.successSoft, border: `1px solid ${C.line}`, borderRadius: 14, padding: 14, display: "flex", justifyContent: "space-between" } },
+        React.createElement("div", null,
+          React.createElement("div", { style: { fontWeight: 800, fontSize: 14.5 } }, "💰 تسديد دين — ", d.subscriberName),
+          React.createElement("div", { style: { fontSize: 12, color: C.muted } }, React.createElement("span", { className: "mono" }, fmtDate(d.createdAt)))
+        ),
+        React.createElement("div", { className: "mono", style: { fontWeight: 800, color: C.success } }, "+", d.amount)
+      ))
+    )
+  );
+}
+
+function PackagesScreen({ packages, onSave, onBack }) {
+  const [name, setName] = useState("");
+  const [price, setPrice] = useState("");
+  const add = () => {
+    if (!name.trim()) return;
+    onSave([...packages, { id: genId(), name: name.trim(), price }]);
+    setName(""); setPrice("");
+  };
+  const remove = (id) => onSave(packages.filter((p) => p.id !== id));
+  return React.createElement("div", { style: { padding: 16, paddingBottom: 100 } },
+    React.createElement("div", { style: { fontWeight: 800, fontSize: 15, marginBottom: 14, color: C.muted } }, "أضف باقات جاهزة عشان تظهر كاقتراحات سريعة عند إضافة أو تجديد مشترك"),
+    React.createElement("div", { style: { display: "flex", gap: 8, marginBottom: 16 } },
+      React.createElement("input", { style: { ...inputStyle(), flex: 2 }, placeholder: "اسم الباقة (مثال: 20 ميجا)", value: name, onChange: (e) => setName(e.target.value) }),
+      React.createElement("input", { style: { ...inputStyle(), flex: 1 }, className: "mono", dir: "ltr", type: "number", placeholder: "السعر", value: price, onChange: (e) => setPrice(e.target.value) }),
+      React.createElement("button", { onClick: add, style: { background: C.brand, color: "#fff", border: "none", borderRadius: 10, padding: "0 16px", fontWeight: 800 } }, "＋")
+    ),
+    React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8 } },
+      packages.length === 0 && React.createElement("div", { style: { textAlign: "center", color: C.muted, padding: "20px 0" } }, "ما فيه باقات مضافة بعد"),
+      packages.map((p) => React.createElement("div", { key: p.id, style: { background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center" } },
+        React.createElement("div", null, React.createElement("span", { style: { fontWeight: 700 } }, p.name), p.price !== "" && React.createElement("span", { className: "mono", style: { color: C.muted, marginRight: 8 } }, p.price)),
+        React.createElement("button", { onClick: () => remove(p.id), style: { background: "none", border: "none", color: C.danger, fontWeight: 700 } }, "🗑")
+      ))
+    )
+  );
+}
+
+
+function resizeImageToDataUrl(file, maxSize) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > height && width > maxSize) { height = Math.round((height * maxSize) / width); width = maxSize; }
+        else if (height > maxSize) { width = Math.round((width * maxSize) / height); height = maxSize; }
+        const canvas = document.createElement("canvas");
+        canvas.width = width; canvas.height = height;
+        canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL("image/png", 0.9));
+      };
+      img.onerror = reject;
+      img.src = e.target.result;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function SettingsScreen({ settings, onSave, onOpenPackages, themeName, onToggleTheme }) {
+  const [f, setF] = useState(settings);
+  const [diag, setDiag] = useState(null);
+  const [backupMsg, setBackupMsg] = useState(null);
+  const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
+
+  const [exporting, setExporting] = useState(false);
+  const doExport = async () => {
+    setExporting(true);
+    try {
+      const r = await exportBackupFile();
+      setBackupMsg(r);
+    } catch (e) {
+      setBackupMsg({ ok: false, msg: "فشل التصدير: " + e.message });
+    }
+    setExporting(false);
+  };
+  const doImport = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    if (!window.confirm("هذا يستبدل كل بياناتك الحالية بمحتوى الملف. متأكد؟")) return;
+    importBackupFile(file, (ok, err) => {
+      setBackupMsg(ok ? { ok: true, msg: "تم استرجاع البيانات ✅ — أعد فتح التطبيق عشان تظهر." } : { ok: false, msg: "تعذر قراءة الملف: " + err });
+    });
+  };
+  const doLogoUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const dataUrl = await resizeImageToDataUrl(file, 300);
+      const next = { ...f, logoDataUrl: dataUrl };
+      setF(next); onSave(next);
+    } catch (err) {
+      alert("تعذر رفع الشعار: " + err.message);
+    }
+  };
+  const removeLogo = () => { const next = { ...f, logoDataUrl: "" }; setF(next); onSave(next); };
+
+  const testStorage = () => {
+    try {
+      localStorage.setItem("__diag_test__", "ok-" + Date.now());
+      const readBack = localStorage.getItem("__diag_test__");
+      if (readBack && readBack.startsWith("ok-")) {
+        setDiag({ ok: true, msg: "✅ التخزين شغال ممتاز على هذا المتصفح." });
+      } else {
+        setDiag({ ok: false, msg: "❌ المتصفح ما يسمح بالتخزين. جرب متصفح Chrome أو Safari عادي، وتأكد إنك مو بوضع تصفح خاص (Private/Incognito)." });
+      }
+    } catch (e) {
+      setDiag({ ok: false, msg: "❌ فشل التخزين تمامًا: " + e.message });
+    }
+  };
+  return React.createElement("div", { style: { padding: 16, paddingBottom: 100 } },
+    React.createElement(Field, { label: "اسم الشركة / الشبكة" }, React.createElement("input", { style: inputStyle(), value: f.companyName, onChange: (e) => set("companyName", e.target.value) })),
+    React.createElement(Field, { label: "رقم التواصل" }, React.createElement("input", { style: inputStyle(), className: "mono", dir: "ltr", value: f.companyPhone, onChange: (e) => set("companyPhone", e.target.value) })),
+    React.createElement(Field, { label: "العنوان" }, React.createElement("input", { style: inputStyle(), value: f.address, onChange: (e) => set("address", e.target.value) })),
+    React.createElement(Field, { label: "رمز العملة" }, React.createElement("input", { style: inputStyle(), value: f.currency, onChange: (e) => set("currency", e.target.value) })),
+    React.createElement(PrimaryButton, { full: true, onClick: () => onSave(f) }, "حفظ الإعدادات"),
+    React.createElement("button", { onClick: onOpenPackages, style: { ...ghostBtn(), width: "100%", marginTop: 12 } }, "📦 إدارة الباقات"),
+
+    React.createElement("div", { style: { marginTop: 24, paddingTop: 16, borderTop: `1px solid ${C.line}` } },
+      React.createElement("div", { style: { fontWeight: 800, fontSize: 14, marginBottom: 8, color: C.muted } }, "المظهر"),
+      React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 } },
+        React.createElement("button", { onClick: () => onToggleTheme("light"), style: { padding: "12px", borderRadius: 12, border: `1.5px solid ${themeName === "light" ? C.brand : C.line}`, background: themeName === "light" ? C.brand : C.surface, color: themeName === "light" ? "#fff" : C.ink, fontWeight: 700 } }, "☀ فاتح"),
+        React.createElement("button", { onClick: () => onToggleTheme("dark"), style: { padding: "12px", borderRadius: 12, border: `1.5px solid ${themeName === "dark" ? C.brand : C.line}`, background: themeName === "dark" ? C.brand : C.surface, color: themeName === "dark" ? "#fff" : C.ink, fontWeight: 700 } }, "🌙 داكن")
+      )
+    ),
+
+    React.createElement("div", { style: { marginTop: 24, paddingTop: 16, borderTop: `1px solid ${C.line}` } },
+      React.createElement("div", { style: { fontWeight: 800, fontSize: 14, marginBottom: 8, color: C.muted } }, "شعار الوصل"),
+      React.createElement("div", { style: { fontSize: 12.5, color: C.muted, marginBottom: 10 } }, "يظهر الشعار أعلى الوصل المطبوع بدل الأيقونة الافتراضية."),
+      f.logoDataUrl && React.createElement("div", { style: { display: "flex", justifyContent: "center", marginBottom: 12 } },
+        React.createElement("img", { src: f.logoDataUrl, style: { maxHeight: 70, maxWidth: 160, borderRadius: 8, border: `1px solid ${C.line}` } })
+      ),
+      React.createElement("div", { style: { display: "grid", gridTemplateColumns: f.logoDataUrl ? "1fr 1fr" : "1fr", gap: 10 } },
+        React.createElement("label", { style: { ...ghostBtn(), cursor: "pointer" } },
+          "🖼 " + (f.logoDataUrl ? "تغيير الشعار" : "رفع شعار"),
+          React.createElement("input", { type: "file", accept: "image/*", onChange: doLogoUpload, style: { display: "none" } })
+        ),
+        f.logoDataUrl && React.createElement("button", { onClick: removeLogo, style: { ...ghostBtn(), color: C.danger } }, "🗑 إزالة الشعار")
+      )
+    ),
+
+    React.createElement("div", { style: { marginTop: 24, paddingTop: 16, borderTop: `1px solid ${C.line}` } },
+      React.createElement("div", { style: { fontWeight: 800, fontSize: 14, marginBottom: 8, color: C.muted } }, "نسخة احتياطية"),
+      React.createElement("div", { style: { fontSize: 12.5, color: C.muted, marginBottom: 10 } }, "يصدّر كل بيانات المشتركين والوصولات كملف واحد تقدر تحفظه بتطبيق الملفات أو أي مكان تختاره."),
+      React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 } },
+        React.createElement(PrimaryButton, { onClick: doExport, disabled: exporting }, exporting ? "..." : "⬇ تصدير نسخة"),
+        React.createElement("label", { style: { ...ghostBtn(), cursor: "pointer" } },
+          "⬆ استيراد نسخة",
+          React.createElement("input", { type: "file", accept: "application/json", onChange: doImport, style: { display: "none" } })
+        )
+      ),
+      backupMsg && React.createElement("div", { style: { marginTop: 10, background: backupMsg.ok ? C.successSoft : C.dangerSoft, color: backupMsg.ok ? C.success : C.danger, borderRadius: 10, padding: 12, fontSize: 12.5, fontWeight: 700 } }, backupMsg.msg)
+    ),
+
+    React.createElement("div", { style: { marginTop: 24, paddingTop: 16, borderTop: `1px solid ${C.line}` } },
+      React.createElement("div", { style: { fontWeight: 800, fontSize: 14, marginBottom: 8, color: C.muted } }, "مشاكل بحفظ البيانات؟"),
+      React.createElement("button", { onClick: testStorage, style: { ...ghostBtn(), width: "100%" } }, "🔍 اختبار التخزين"),
+      diag && React.createElement("div", { style: { marginTop: 10, background: diag.ok ? C.successSoft : C.dangerSoft, color: diag.ok ? C.success : C.danger, borderRadius: 10, padding: 12, fontSize: 12.5, whiteSpace: "pre-line", fontWeight: 700 } }, diag.msg)
+    )
+  );
+}
+
+
+const DEVICE_TYPES = ["راوتر", "سويج", "سكتور / AP", "نقطة وصل PtP", "أنتين", "أخرى"];
+const DEVICE_BRANDS = ["Ubiquiti", "MikroTik", "Mimosa", "Cisco", "أخرى"];
+const DEVICE_STATUS = { active: { label: "نشط", color: () => C.success, soft: () => C.successSoft }, down: { label: "متوقف", color: () => C.danger, soft: () => C.dangerSoft }, maintenance: { label: "صيانة", color: () => C.warning, soft: () => C.warningSoft } };
+
+function DeviceBadge({ status }) {
+  const s = DEVICE_STATUS[status] || DEVICE_STATUS.active;
+  return React.createElement("span", { style: { background: s.soft(), color: s.color(), fontSize: 12, fontWeight: 700, padding: "3px 10px", borderRadius: 999, whiteSpace: "nowrap" } }, s.label);
+}
+
+function baseUrl(device) {
+  const port = device.port ? `:${device.port}` : "";
+  return `${device.protocol || "http"}://${device.ip}${port}`;
+}
+function basicAuthHeader(device) {
+  return "Basic " + btoa(`${device.username || ""}:${device.password || ""}`);
+}
+
+async function fetchMikroTikStatus(device) {
+  if (!device.ip) return { ok: false, msg: "ما فيه عنوان IP مسجَّل" };
+  try {
+    const headers = { Authorization: basicAuthHeader(device) };
+    const resRes = await fetch(`${baseUrl(device)}/rest/system/resource`, { headers });
+    if (!resRes.ok) return { ok: false, msg: `فشل الاتصال (كود ${resRes.status}) — تأكد من اليوزر/الباسورد وتفعيل خدمة www-ssl/www على الراوتر` };
+    const resData = await resRes.json();
+    let clients = null;
+    try {
+      const wRes = await fetch(`${baseUrl(device)}/rest/interface/wireless/registration-table`, { headers });
+      if (wRes.ok) { const wData = await wRes.json(); clients = Array.isArray(wData) ? wData.length : null; }
+    } catch (e) { /* بعض الأجهزة سلكية بدون واجهة لاسلكية */ }
+    return { ok: true, uptime: resData.uptime || "—", cpuLoad: resData["cpu-load"] != null ? `${resData["cpu-load"]}%` : "—", boardName: resData["board-name"] || device.model, clients: clients != null ? clients : "—" };
+  } catch (e) {
+    return { ok: false, msg: "تعذر الاتصال: " + e.message + " — تأكد إنك على نفس الشبكة، والعنوان صحيح، وREST API مفعّل" };
+  }
+}
+
+async function fetchUbiquitiStatus(device) {
+  if (!device.ip) return { ok: false, msg: "ما فيه عنوان IP مسجَّل" };
+  const base = baseUrl(device);
+  try {
+    try {
+      await fetch(`${base}/login.cgi`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: `username=${encodeURIComponent(device.username || "")}&password=${encodeURIComponent(device.password || "")}`,
+      });
+    } catch (e) { /* بعض الإصدارات لا تملك login.cgi أصلًا، نكمل ونجرب status.cgi مباشرة */ }
+
+    const headers = { Authorization: basicAuthHeader(device) };
+    const res = await fetch(`${base}/status.cgi`, { headers, credentials: "include" });
+    const text = await res.text();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (e) {
+      return { ok: false, msg: "الجهاز رجّع صفحة تسجيل دخول وليس بيانات JSON — تأكد من صحة اليوزر/الباسورد. لو صحيحة، فهذا الإصدار من AirOS قد يستخدم آلية تسجيل دخول مختلفة عن المتوقع." };
+    }
+    const wireless = data.wireless || {};
+    const stations = wireless.sta || wireless.stations || [];
+    return {
+      ok: true,
+      uptime: data.host && data.host.uptime ? `${Math.floor(data.host.uptime / 3600)} ساعة` : "—",
+      signal: wireless.signal != null ? `${wireless.signal} dBm` : "—",
+      noise: wireless.noisef != null ? `${wireless.noisef} dBm` : "—",
+      clients: Array.isArray(stations) ? stations.length : "—",
+      ccq: wireless.ccq != null ? `${(wireless.ccq / 10).toFixed(0)}%` : "—",
+    };
+  } catch (e) {
+    return { ok: false, msg: "تعذر الاتصال: " + e.message + " — تأكد إنك على نفس الشبكة، وأن الجهاز يدعم واجهة status.cgi بهذا الإصدار" };
+  }
+}
+
+async function fetchLiveDeviceStatus(device) {
+  if (device.brand === "MikroTik") return fetchMikroTikStatus(device);
+  if (device.brand === "Ubiquiti") return fetchUbiquitiStatus(device);
+  return { ok: false, msg: "الاتصال الحي عبر HTTP متاح حاليًا فقط لأجهزة MikroTik وUbiquiti — جرّب SSH بالأسفل" };
+}
+
+function parseSshOutput(brand, command, text) {
+  const raw = String(text || "");
+  const kv = {};
+  raw.split(/[\n;]+/).forEach((line) => {
+    const m = line.match(/^\s*([A-Za-z0-9_.\-]+)\s*[:=]\s*(.+?)\s*$/);
+    if (m) {
+      const k = m[1].trim();
+      const v = m[2].trim();
+      if (k && v && !(k in kv)) kv[k] = v;
+    }
+  });
+
+  const pick = (keys, label) => {
+    for (const k of keys) { if (kv[k] != null && kv[k] !== "") return { label, value: kv[k] }; }
+    return null;
+  };
+
+  let items = [];
+  if (brand === "MikroTik") {
+    items = [
+      pick(["uptime"], "وقت التشغيل"),
+      pick(["cpu-load"], "استخدام المعالج"),
+      pick(["version"], "الإصدار"),
+      pick(["board-name"], "الموديل"),
+      pick(["free-memory"], "ذاكرة متاحة"),
+      pick(["total-memory"], "إجمالي الذاكرة"),
+    ].filter(Boolean);
+  } else if (brand === "Ubiquiti") {
+    items = [
+      pick(["wlanConfig.1.essid", "essid", "status.1.ssid"], "اسم الشبكة"),
+      pick(["signal", "wstats.signal", "status.1.signal"], "الإشارة"),
+      pick(["noise", "wstats.noise", "status.1.noise"], "الضجيج"),
+      pick(["ccq", "wstats.ccq", "status.1.ccq"], "CCQ"),
+      pick(["uptime", "sysUptime", "host.uptime"], "وقت التشغيل"),
+      pick(["wlanConfig.1.txrate", "txrate", "status.1.rate"], "سرعة الإرسال"),
+      pick(["wlanConfig.1.rxrate", "rxrate"], "سرعة الاستقبال"),
+    ].filter(Boolean);
+  }
+
+  if (items.length === 0) {
+    items = Object.keys(kv).slice(0, 8).map((k) => ({ label: k, value: kv[k] }));
+  }
+  return items.length > 0 ? items : null;
+}
+
+function defaultSshCommand(brand) {
+  if (brand === "MikroTik") return "/system resource print";
+  if (brand === "Ubiquiti") return "mca-status";
+  if (brand === "Cisco") return "show version";
+  if (brand === "Mimosa") return "cat /proc/uptime";
+  return "uptime";
+}
+
+function parseMikroTikResource(text) {
+  const map = {};
+  text.split("\n").forEach((line) => {
+    const idx = line.indexOf(":");
+    if (idx === -1) return;
+    const key = line.slice(0, idx).trim().toLowerCase().replace(/\s+/g, "-");
+    const val = line.slice(idx + 1).trim();
+    if (key) map[key] = val;
+  });
+  if (!Object.keys(map).length) return null;
+  return [
+    map["uptime"] && { label: "وقت التشغيل", value: map["uptime"] },
+    map["version"] && { label: "الإصدار", value: map["version"] },
+    map["cpu-load"] && { label: "استخدام المعالج", value: map["cpu-load"] },
+    (map["free-memory"] || map["free-hdd-space"]) && { label: "ذاكرة متاحة", value: map["free-memory"] || map["free-hdd-space"] },
+    map["board-name"] && { label: "الموديل", value: map["board-name"] },
+  ].filter(Boolean);
+}
+
+function parseUbiquitiMca(text) {
+  const map = {};
+  text.split("\n").forEach((line) => {
+    const idx = line.indexOf("=");
+    if (idx === -1) return;
+    map[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
+  });
+  if (!Object.keys(map).length) return null;
+  const uptimeSec = Number(map["host.uptime"] || 0);
+  const uptimeStr = uptimeSec ? `${Math.floor(uptimeSec / 86400)} يوم ${Math.floor((uptimeSec % 86400) / 3600)} ساعة` : null;
+  return [
+    map["wireless.essid"] && { label: "اسم الشبكة", value: map["wireless.essid"] },
+    map["wireless.signal"] && { label: "الإشارة", value: `${map["wireless.signal"]} dBm` },
+    map["wireless.ccq"] && { label: "CCQ", value: `${(Number(map["wireless.ccq"]) / 10).toFixed(0)}%` },
+    map["wireless.noisef"] && { label: "الضوضاء", value: `${map["wireless.noisef"]} dBm` },
+    uptimeStr && { label: "وقت التشغيل", value: uptimeStr },
+    map["host.cpuload"] && { label: "استخدام المعالج", value: `${map["host.cpuload"]}%` },
+  ].filter(Boolean);
+}
+
+function parseSshOutput(brand, command, text) {
+  try {
+    if (brand === "MikroTik" && command.includes("resource")) return parseMikroTikResource(text);
+    if (brand === "Ubiquiti" && command.includes("mca-status")) return parseUbiquitiMca(text);
+  } catch (e) { /* رجوع للنص الخام عند أي خطأ تحليل */ }
+  return null;
+}
+
+function sshAvailable() {
+  return !!(window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.SshPlugin);
+}
+
+async function runSshCommand(device, command) {
+  if (!isNativeApp()) return { ok: false, msg: "الاتصال عبر SSH متاح فقط داخل التطبيق المثبَّت (APK)، وليس من متصفح الويب." };
+  if (!sshAvailable()) return { ok: false, msg: "إضافة SSH الأصلية غير مُضافة بعد لهذا الإصدار من التطبيق. راجع خطوات تفعيل SshPlugin." };
+  try {
+    const res = await window.Capacitor.Plugins.SshPlugin.runCommand({
+      host: device.ip,
+      port: Number(device.sshPort || 22),
+      username: device.username || "",
+      password: device.password || "",
+      command,
+    });
+    return { ok: true, output: res.output || "(لا يوجد ناتج)" };
+  } catch (e) {
+    return { ok: false, msg: "فشل اتصال SSH: " + (e && e.message ? e.message : e) };
+  }
+}
+
+function checkDeviceReachable(ip, onResult) {
+  const start = performance.now();
+  const img = new Image();
+  let done = false;
+  const finish = (ok) => { if (done) return; done = true; onResult({ ok, ms: (performance.now() - start).toFixed(0) }); };
+  img.onload = () => finish(true);
+  img.onerror = () => finish(true); // device responded (even with non-image content) -> reachable
+  img.src = `http://${ip}/favicon.ico?_=${Date.now()}`;
+  setTimeout(() => finish(false), 2500);
+}
+
+function DeviceForm({ initial, onSave, onCancel }) {
+  const [f, setF] = useState(initial || { name: "", type: DEVICE_TYPES[0], brand: DEVICE_BRANDS[0], model: "", ip: "", mac: "", location: "", status: "active", notes: "", username: "", password: "", protocol: "http", port: "", sshPort: "" });
+  const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
+  const valid = f.name.trim() && f.type && f.brand;
+  const supportsHttp = f.brand === "MikroTik" || f.brand === "Ubiquiti";
+  const supportsLive = true;
+  return React.createElement("div", { style: { padding: 16, paddingBottom: 100 } },
+    React.createElement(Field, { label: "اسم / تسمية الجهاز *" }, React.createElement("input", { style: inputStyle(), value: f.name, onChange: (e) => set("name", e.target.value), placeholder: "مثال: سكتور برج المنصور 1" })),
+    React.createElement("div", { style: { display: "flex", gap: 10 } },
+      React.createElement("div", { style: { flex: 1 } }, React.createElement(Field, { label: "النوع *" }, React.createElement("select", { style: inputStyle(), value: f.type, onChange: (e) => set("type", e.target.value) }, DEVICE_TYPES.map((t) => React.createElement("option", { key: t, value: t }, t))))),
+      React.createElement("div", { style: { flex: 1 } }, React.createElement(Field, { label: "الشركة المصنّعة *" }, React.createElement("select", { style: inputStyle(), value: f.brand, onChange: (e) => set("brand", e.target.value) }, DEVICE_BRANDS.map((b) => React.createElement("option", { key: b, value: b }, b)))))
+    ),
+    React.createElement(Field, { label: "الموديل" }, React.createElement("input", { style: inputStyle(), value: f.model, onChange: (e) => set("model", e.target.value), placeholder: "مثال: RB4011 / EdgeMax / PMP450" })),
+    React.createElement("div", { style: { display: "flex", gap: 10 } },
+      React.createElement("div", { style: { flex: 1 } }, React.createElement(Field, { label: "عنوان IP" }, React.createElement("input", { style: inputStyle(), className: "mono", dir: "ltr", value: f.ip, onChange: (e) => set("ip", e.target.value), placeholder: "192.168.1.1" }))),
+      React.createElement("div", { style: { flex: 1 } }, React.createElement(Field, { label: "عنوان MAC (اختياري)" }, React.createElement("input", { style: inputStyle(), className: "mono", dir: "ltr", value: f.mac, onChange: (e) => set("mac", e.target.value) })))
+    ),
+    React.createElement(Field, { label: "الموقع / البرج" }, React.createElement("input", { style: inputStyle(), value: f.location, onChange: (e) => set("location", e.target.value), placeholder: "مثال: برج المنصور" })),
+    React.createElement(Field, { label: "الحالة" },
+      React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 } },
+        Object.keys(DEVICE_STATUS).map((k) => React.createElement("button", { key: k, type: "button", onClick: () => set("status", k), style: { padding: "10px 6px", borderRadius: 10, border: `1.5px solid ${f.status === k ? C.brand : C.line}`, background: f.status === k ? C.brand : C.surface, color: f.status === k ? "#fff" : C.ink, fontWeight: 700, fontSize: 12.5 } }, DEVICE_STATUS[k].label))
+      )
+    ),
+    supportsLive && React.createElement("div", { style: { marginTop: 6, marginBottom: 6, paddingTop: 14, borderTop: `1px solid ${C.line}` } },
+      React.createElement("div", { style: { fontWeight: 800, fontSize: 13.5, marginBottom: 4 } }, "🔌 بيانات الاتصال (لجلب البيانات الحية)"),
+      React.createElement("div", { style: { fontSize: 11.5, color: C.muted, marginBottom: 10 } },
+        supportsHttp ? (f.brand === "MikroTik" ? "يتصل عبر REST API (HTTP) أو SSH كبديل." : "يتصل عبر واجهة حالة AirOS (HTTP) أو SSH كبديل.") : "يتصل عبر SSH."
+      ),
+      React.createElement("div", { style: { display: "flex", gap: 10 } },
+        React.createElement("div", { style: { flex: 1 } }, React.createElement(Field, { label: "اسم المستخدم" }, React.createElement("input", { style: inputStyle(), className: "mono", dir: "ltr", value: f.username, onChange: (e) => set("username", e.target.value) }))),
+        React.createElement("div", { style: { flex: 1 } }, React.createElement(Field, { label: "كلمة المرور" }, React.createElement("input", { style: inputStyle(), className: "mono", dir: "ltr", type: "password", value: f.password, onChange: (e) => set("password", e.target.value) })))
+      ),
+      supportsHttp && React.createElement("div", { style: { display: "flex", gap: 10 } },
+        React.createElement("div", { style: { flex: 1 } }, React.createElement(Field, { label: "بروتوكول HTTP" }, React.createElement("select", { style: inputStyle(), value: f.protocol, onChange: (e) => set("protocol", e.target.value) }, ["http", "https"].map((p) => React.createElement("option", { key: p, value: p }, p.toUpperCase()))))),
+        React.createElement("div", { style: { flex: 1 } }, React.createElement(Field, { label: "منفذ HTTP (اختياري)" }, React.createElement("input", { style: inputStyle(), className: "mono", dir: "ltr", value: f.port, onChange: (e) => set("port", e.target.value), placeholder: "افتراضي 80" })))
+      ),
+      React.createElement(Field, { label: "منفذ SSH" }, React.createElement("input", { style: inputStyle(), className: "mono", dir: "ltr", value: f.sshPort, onChange: (e) => set("sshPort", e.target.value), placeholder: "افتراضي 22" }))
+    ),
+    React.createElement(Field, { label: "ملاحظات" }, React.createElement("input", { style: inputStyle(), value: f.notes, onChange: (e) => set("notes", e.target.value) })),
+    React.createElement(PrimaryButton, { full: true, disabled: !valid, onClick: () => onSave(f) }, "حفظ الجهاز"),
+    React.createElement("button", { onClick: onCancel, style: { width: "100%", marginTop: 10, background: "none", border: "none", color: C.muted, fontWeight: 700, padding: 10 } }, "إلغاء")
+  );
+}
+
+function DeviceDetailSheet({ device, onClose, onEdit, onDelete }) {
+  const [checking, setChecking] = useState(false);
+  const [result, setResult] = useState(null);
+  const [live, setLive] = useState(null);
+  const [sshCmd, setSshCmd] = useState(defaultSshCommand(device.brand));
+  const [sshBusy, setSshBusy] = useState(false);
+  const [sshResult, setSshResult] = useState(null);
+  const [showRawSsh, setShowRawSsh] = useState(false);
+  const runSsh = async () => {
+    setSshBusy(true); setSshResult(null);
+    const r = await runSshCommand(device, sshCmd);
+    setSshResult(r); setSshBusy(false);
+  };
+  const [liveBusy, setLiveBusy] = useState(false);
+  const supportsLive = device.brand === "MikroTik" || device.brand === "Ubiquiti";
+  const runCheck = () => {
+    if (!device.ip) { setResult({ ok: false, msg: "ما فيه عنوان IP مسجَّل لهذا الجهاز" }); return; }
+    setChecking(true); setResult(null);
+    checkDeviceReachable(device.ip, (r) => { setChecking(false); setResult(r); });
+  };
+  const runLive = async () => {
+    setLiveBusy(true); setLive(null);
+    const r = await fetchLiveDeviceStatus(device);
+    setLive(r); setLiveBusy(false);
+  };
+  return React.createElement("div", { style: { position: "fixed", inset: 0, background: "rgba(10,20,22,.45)", display: "flex", alignItems: "flex-end", zIndex: 40 }, onClick: onClose },
+    React.createElement("div", { onClick: (e) => e.stopPropagation(), style: { background: C.surface, width: "100%", maxWidth: 460, margin: "0 auto", borderRadius: "20px 20px 0 0", padding: 20, maxHeight: "85vh", overflowY: "auto" } },
+      React.createElement("div", { style: { width: 40, height: 4, background: C.line, borderRadius: 4, margin: "0 auto 16px" } }),
+      React.createElement("div", { style: { display: "flex", justifyContent: "space-between" } }, React.createElement("div", { style: { fontWeight: 900, fontSize: 19 } }, device.name), React.createElement(DeviceBadge, { status: device.status })),
+      React.createElement("div", { style: { fontSize: 13, color: C.muted, marginBottom: 16 } }, device.brand, " · ", device.type, device.model ? " · " + device.model : ""),
+      React.createElement("div", { style: { background: C.paper, borderRadius: 14, padding: 14, marginBottom: 16 } },
+        device.ip && React.createElement("div", { style: { display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: `1px solid ${C.line}` } }, React.createElement("span", { style: { color: C.muted, fontSize: 13 } }, "IP"), React.createElement("span", { className: "mono", style: { fontWeight: 700 } }, device.ip)),
+        device.mac && React.createElement("div", { style: { display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: `1px solid ${C.line}` } }, React.createElement("span", { style: { color: C.muted, fontSize: 13 } }, "MAC"), React.createElement("span", { className: "mono", style: { fontWeight: 700 } }, device.mac)),
+        device.location && React.createElement("div", { style: { display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: `1px solid ${C.line}` } }, React.createElement("span", { style: { color: C.muted, fontSize: 13 } }, "الموقع"), React.createElement("span", { style: { fontWeight: 700 } }, device.location)),
+        device.notes && React.createElement("div", { style: { padding: "6px 0", fontSize: 13, color: C.muted } }, device.notes)
+      ),
+
+      supportsLive && React.createElement("div", { style: { marginBottom: 18 } },
+        React.createElement(PrimaryButton, { full: true, disabled: liveBusy, onClick: runLive }, liveBusy ? "جارِ الجلب..." : "🔄 جلب بيانات حية من الجهاز"),
+        live && (live.ok
+          ? React.createElement("div", { style: { marginTop: 12, background: `linear-gradient(135deg, ${C.brand} 0%, #0A2E34 100%)`, borderRadius: 14, padding: 16, color: "#fff" } },
+              React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 } },
+                live.clients != null && React.createElement("div", null, React.createElement("div", { className: "mono", style: { fontSize: 20, fontWeight: 900 } }, live.clients), React.createElement("div", { style: { fontSize: 11, opacity: .8 } }, "متصلين")),
+                live.uptime && React.createElement("div", null, React.createElement("div", { className: "mono", style: { fontSize: 15, fontWeight: 800 } }, live.uptime), React.createElement("div", { style: { fontSize: 11, opacity: .8 } }, "وقت التشغيل")),
+                live.signal && React.createElement("div", null, React.createElement("div", { className: "mono", style: { fontSize: 15, fontWeight: 800, color: C.accent } }, live.signal), React.createElement("div", { style: { fontSize: 11, opacity: .8 } }, "الإشارة")),
+                live.ccq && React.createElement("div", null, React.createElement("div", { className: "mono", style: { fontSize: 15, fontWeight: 800 } }, live.ccq), React.createElement("div", { style: { fontSize: 11, opacity: .8 } }, "CCQ")),
+                live.cpuLoad && React.createElement("div", null, React.createElement("div", { className: "mono", style: { fontSize: 15, fontWeight: 800 } }, live.cpuLoad), React.createElement("div", { style: { fontSize: 11, opacity: .8 } }, "استخدام المعالج"))
+              )
+            )
+          : React.createElement("div", { style: { marginTop: 10, background: C.dangerSoft, color: C.danger, borderRadius: 10, padding: 12, fontSize: 12.5, fontWeight: 700 } }, live.msg)
+        )
+      ),
+
+      React.createElement("div", { style: { marginBottom: 18, borderTop: `1px solid ${C.line}`, paddingTop: 16 } },
+        React.createElement("div", { style: { fontWeight: 800, fontSize: 14, marginBottom: 8 } }, "🔐 تنفيذ أمر عبر SSH"),
+        React.createElement("input", { style: { ...inputStyle(), marginBottom: 10 }, className: "mono", dir: "ltr", value: sshCmd, onChange: (e) => setSshCmd(e.target.value) }),
+        React.createElement(PrimaryButton, { full: true, disabled: sshBusy, onClick: runSsh }, sshBusy ? "جارِ الاتصال..." : "▶ تنفيذ الأمر"),
+        sshResult && (sshResult.ok
+          ? (() => {
+              const parsed = parseSshOutput(device.brand, sshCmd, sshResult.output);
+              return React.createElement(React.Fragment, null,
+                parsed && React.createElement("div", { style: { marginTop: 12, background: `linear-gradient(135deg, ${C.brand} 0%, #0A2E34 100%)`, borderRadius: 14, padding: 16, color: "#fff" } },
+                  React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 } },
+                    parsed.map((item, i) => React.createElement("div", { key: i },
+                      React.createElement("div", { className: "mono", style: { fontSize: 14.5, fontWeight: 800 } }, item.value),
+                      React.createElement("div", { style: { fontSize: 11, opacity: .8 } }, item.label)
+                    ))
+                  )
+                ),
+                React.createElement("details", { style: { marginTop: 10 } },
+                  React.createElement("summary", { style: { fontSize: 12, color: C.muted, cursor: "pointer", fontWeight: 700 } }, parsed ? "عرض الناتج الخام" : "الناتج"),
+                  React.createElement("pre", { className: "mono", style: { marginTop: 8, background: "#0F1719", color: "#B7D9D4", borderRadius: 10, padding: 12, fontSize: 11.5, whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 260, overflowY: "auto" } }, sshResult.output)
+                )
+              );
+            })()
+          : React.createElement("div", { style: { marginTop: 10, background: C.dangerSoft, color: C.danger, borderRadius: 10, padding: 12, fontSize: 12.5, fontWeight: 700 } }, sshResult.msg)
+        )
+      ),
+
+      React.createElement(PrimaryButton, { full: true, disabled: checking, onClick: runCheck }, checking ? "جارِ الفحص..." : "📶 فحص الاتصال بالجهاز"),
+      result && React.createElement("div", { style: { marginTop: 10, background: result.ok ? C.successSoft : C.dangerSoft, color: result.ok ? C.success : C.danger, borderRadius: 10, padding: 12, fontSize: 13, fontWeight: 700 } },
+        result.ok ? `✅ الجهاز متصل — استجاب خلال ${result.ms} ms` : (result.msg || "❌ ما قدرنا نتواصل مع الجهاز")
+      ),
+      React.createElement("div", { style: { fontSize: 11, color: C.muted, marginTop: 8, marginBottom: 18 } }, "ملاحظة: يتطلب هذا أن يكون جهازك على نفس الشبكة المحلية للجهاز المستهدف، وأن يعمل التطبيق كتطبيق APK مثبَّت (وليس من متصفح الويب مباشرة)."),
+      React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 } },
+        React.createElement("button", { onClick: () => onEdit(device), style: ghostBtn() }, "✏ تعديل"),
+        React.createElement("button", { onClick: () => onDelete(device), style: { ...ghostBtn(), color: C.danger } }, "🗑 حذف")
+      )
+    )
+  );
+}
+
+function DevicesScreen({ devices, onAdd, onOpen }) {
+  const [q, setQ] = useState(""); const [brandFilter, setBrandFilter] = useState("all");
+  const counts = useMemo(() => { const c = { all: devices.length, active: 0, down: 0, maintenance: 0 }; devices.forEach((d) => (c[d.status] = (c[d.status] || 0) + 1)); return c; }, [devices]);
+  const filtered = devices.filter((d) => (brandFilter === "all" ? true : d.brand === brandFilter))
+    .filter((d) => (d.name + (d.ip || "") + (d.location || "")).toLowerCase().includes(q.toLowerCase()));
+  return React.createElement("div", { style: { paddingBottom: 90 } },
+    React.createElement("div", { style: { padding: "14px 14px 0" } },
+      React.createElement("div", { style: { display: "flex", gap: 8, marginBottom: 14 } },
+        React.createElement(StatTile, { label: "الكل", value: counts.all }),
+        React.createElement(StatTile, { label: "نشط", value: counts.active || 0, color: C.success }),
+        React.createElement(StatTile, { label: "متوقف", value: counts.down || 0, color: C.danger }),
+        React.createElement(StatTile, { label: "صيانة", value: counts.maintenance || 0, color: C.warning })
+      )
+    ),
+    React.createElement("div", { style: { padding: 14 } },
+      React.createElement("input", { placeholder: "بحث بالاسم أو IP أو الموقع", value: q, onChange: (e) => setQ(e.target.value), style: { ...inputStyle(), marginBottom: 12 } }),
+      React.createElement("div", { style: { display: "flex", gap: 8, overflowX: "auto" } },
+        ["all", ...DEVICE_BRANDS].map((b) => React.createElement("button", { key: b, onClick: () => setBrandFilter(b), style: { flexShrink: 0, padding: "7px 14px", borderRadius: 999, border: `1.5px solid ${brandFilter === b ? C.brand : C.line}`, background: brandFilter === b ? C.brand : C.surface, color: brandFilter === b ? "#fff" : C.ink, fontSize: 13, fontWeight: 700 } }, b === "all" ? "الكل" : b))
+      )
+    ),
+    React.createElement("div", { style: { padding: "0 14px", display: "flex", flexDirection: "column", gap: 10 } },
+      filtered.length === 0 && React.createElement("div", { style: { textAlign: "center", color: C.muted, padding: "40px 10px" } }, "ما فيه أجهزة مضافة. اضغط + بالأسفل"),
+      filtered.map((d) => React.createElement("div", { key: d.id, onClick: () => onOpen(d), style: { background: C.surface, borderRadius: 14, padding: 14, border: `1px solid ${C.line}`, boxShadow: "0 1px 3px rgba(18,32,36,.06)", cursor: "pointer" } },
+        React.createElement("div", { style: { display: "flex", justifyContent: "space-between" } },
+          React.createElement("div", null,
+            React.createElement("div", { style: { fontWeight: 800, fontSize: 15 } }, d.name),
+            React.createElement("div", { style: { fontSize: 12.5, color: C.muted } }, d.brand, " · ", d.type)
+          ),
+          React.createElement(DeviceBadge, { status: d.status })
+        ),
+        (d.ip || d.location) && React.createElement("div", { style: { display: "flex", justifyContent: "space-between", marginTop: 10, fontSize: 12.5, color: C.muted } },
+          React.createElement("span", { className: "mono" }, d.ip || ""), React.createElement("span", null, d.location || "")
+        )
+      ))
+    ),
+    React.createElement("button", { onClick: onAdd, className: "no-print", style: { position: "fixed", bottom: 84, left: "50%", transform: "translateX(calc(-50% + 190px))", background: C.accent, color: C.brand, border: "none", borderRadius: 999, width: 54, height: 54, fontSize: 24, boxShadow: "0 6px 16px rgba(14,59,67,.3)" } }, "＋")
+  );
+}
+
+function NetworkToolsScreen({ onOpenDevices, deviceCount }) {
+  const [pingResult, setPingResult] = useState(null);
+  const [pinging, setPinging] = useState(false);
+  const [speedResult, setSpeedResult] = useState(null);
+  const [testing, setTesting] = useState(false);
+  const [speedStage, setSpeedStage] = useState("");
+
+  const runPing = async () => {
+    setPinging(true); setPingResult(null);
+    const times = [];
+    for (let i = 0; i < 5; i++) {
+      const start = performance.now();
+      try {
+        await new Promise((resolve, reject) => {
+          const img = new Image();
+          img.onload = resolve; img.onerror = resolve;
+          img.src = `https://www.gstatic.com/generate_204?_=${Date.now()}_${i}`;
+          setTimeout(reject, 3000);
+        });
+        times.push(performance.now() - start);
+      } catch (e) { /* timeout, skip */ }
+    }
+    setPinging(false);
+    if (times.length === 0) { setPingResult({ ok: false }); return; }
+    const avg = times.reduce((a, b) => a + b, 0) / times.length;
+    setPingResult({ ok: true, avg: avg.toFixed(0), min: Math.min(...times).toFixed(0), max: Math.max(...times).toFixed(0), count: times.length });
+  };
+
+  const runSpeedTest = async () => {
+    setTesting(true); setSpeedResult(null); setSpeedStage("جارِ اختبار سرعة التنزيل...");
+    try {
+      const bytes = 15000000;
+      const start = performance.now();
+      const res = await fetch(`https://speed.cloudflare.com/__down?bytes=${bytes}&_=${Date.now()}`);
+      const blob = await res.blob();
+      const seconds = (performance.now() - start) / 1000;
+      const mbps = ((blob.size * 8) / seconds / 1_000_000).toFixed(1);
+
+      setSpeedStage("جارِ اختبار سرعة الرفع...");
+      const uploadData = new Blob([new Uint8Array(4_000_000)]);
+      const uStart = performance.now();
+      await fetch("https://speed.cloudflare.com/__up", { method: "POST", body: uploadData });
+      const uSeconds = (performance.now() - uStart) / 1000;
+      const uMbps = ((uploadData.size * 8) / uSeconds / 1_000_000).toFixed(1);
+
+      setSpeedResult({ ok: true, download: mbps, upload: uMbps });
+    } catch (e) {
+      setSpeedResult({ ok: false, msg: e.message });
+    }
+    setTesting(false); setSpeedStage("");
+  };
+
+  return React.createElement("div", { style: { padding: 16, paddingBottom: 100 } },
+    React.createElement("button", { onClick: onOpenDevices, style: { width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center", background: C.brand, color: "#fff", border: "none", borderRadius: 14, padding: "16px", marginBottom: 24, fontWeight: 800, fontSize: 15 } },
+      React.createElement("span", null, "🖧 إدارة أجهزة الشبكة"),
+      React.createElement("span", { className: "mono", style: { background: "rgba(255,255,255,.18)", borderRadius: 999, padding: "3px 10px", fontSize: 13 } }, deviceCount || 0)
+    ),
+    React.createElement("div", { style: { fontWeight: 800, fontSize: 15, marginBottom: 4 } }, "📡 اختبار زمن الاستجابة"),
+    React.createElement("div", { style: { fontSize: 12.5, color: C.muted, marginBottom: 12 } }, "قياس تقريبي لزمن استجابة الإنترنت (المتصفح لا يدعم بروتوكول Ping الحقيقي ICMP، فهذا قياس بديل مكافئ بالاعتماد على خوادم Google)."),
+    React.createElement(PrimaryButton, { full: true, disabled: pinging, onClick: runPing }, pinging ? "جارِ الاختبار..." : "▶ ابدأ اختبار الاستجابة"),
+    pingResult && (pingResult.ok
+      ? React.createElement("div", { style: { marginTop: 14, background: C.successSoft, borderRadius: 12, padding: 14 } },
+          React.createElement("div", { style: { display: "flex", justifyContent: "space-between", marginBottom: 6 } }, React.createElement("span", { style: { fontWeight: 700, color: C.success } }, "المتوسط"), React.createElement("span", { className: "mono", style: { fontWeight: 900, color: C.success } }, `${pingResult.avg} ms`)),
+          React.createElement("div", { style: { display: "flex", justifyContent: "space-between", fontSize: 12.5, color: C.muted } },
+            React.createElement("span", null, `الأدنى: ${pingResult.min} ms`), React.createElement("span", null, `الأعلى: ${pingResult.max} ms`)
+          )
+        )
+      : React.createElement("div", { style: { marginTop: 14, background: C.dangerSoft, color: C.danger, borderRadius: 12, padding: 14, fontWeight: 700 } }, "تعذر الاتصال — تحقق من اتصال الإنترنت")
+    ),
+
+    React.createElement("div", { style: { marginTop: 28, paddingTop: 20, borderTop: `1px solid ${C.line}` } },
+      React.createElement("div", { style: { fontWeight: 800, fontSize: 15, marginBottom: 4 } }, "⚡ اختبار سرعة الإنترنت"),
+      React.createElement("div", { style: { fontSize: 12.5, color: C.muted, marginBottom: 12 } }, "يقيس سرعة التنزيل والرفع الفعلية عبر خوادم Cloudflare (يستهلك بيانات إنترنت أثناء الاختبار)."),
+      React.createElement(PrimaryButton, { full: true, disabled: testing, onClick: runSpeedTest }, testing ? speedStage || "جارِ الاختبار..." : "▶ ابدأ اختبار السرعة"),
+      speedResult && (speedResult.ok
+        ? React.createElement("div", { style: { marginTop: 14, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 } },
+            React.createElement(StatTile, { label: "تنزيل Mbps", value: speedResult.download, color: C.brand }),
+            React.createElement(StatTile, { label: "رفع Mbps", value: speedResult.upload, color: C.accent })
+          )
+        : React.createElement("div", { style: { marginTop: 14, background: C.dangerSoft, color: C.danger, borderRadius: 12, padding: 14, fontWeight: 700 } }, "فشل اختبار السرعة: " + (speedResult.msg || ""))
+      )
+    )
+  );
+}
+
+
+function BottomNav({ view, setView }) {
+  const items = [["home", "الرئيسية", "🏠"], ["add", "إضافة", "＋"], ["network", "الشبكة", "📡"], ["history", "السجل", "🧾"], ["settings", "الإعدادات", "⚙"]];
+  const networkGroup = ["network", "devices", "device-add", "device-edit"];
+  return React.createElement("div", { className: "no-print", style: { position: "fixed", bottom: 0, left: "50%", transform: "translateX(-50%)", width: "100%", maxWidth: 460, background: C.surface, borderTop: `1px solid ${C.line}`, display: "flex", padding: "8px 4px" } },
+    items.map(([key, label, icon]) => { const active = key === "network" ? networkGroup.includes(view) : view === key; return React.createElement("button", { key, onClick: () => setView(key), style: { flex: 1, background: "none", border: "none", display: "flex", flexDirection: "column", alignItems: "center", gap: 3, padding: "6px 0", color: active ? C.brand : C.muted } },
+      React.createElement("span", { style: { fontSize: 18 } }, icon), React.createElement("span", { style: { fontSize: 10.5, fontWeight: 700 } }, label)
+    ); })
+  );
+}
+
+function App() {
+  const [themeName, setThemeName] = useState(() => loadKey("isp_theme", "light"));
+  const [themeTick, setThemeTick] = useState(0);
+  const toggleTheme = (name) => { applyTheme(name); saveKey("isp_theme", name); setThemeName(name); setThemeTick((t) => t + 1); };
+  useEffect(() => { applyTheme(themeName); document.body.style.background = C.paper; }, []);
+
+  const [subs, setSubs] = useState(() => loadKey("isp_subscribers", []));
+  const [payments, setPayments] = useState(() => loadKey("isp_payments", []));
+  const [debtPayments, setDebtPayments] = useState(() => loadKey("isp_debt_payments", []));
+  const [settings, setSettings] = useState(() => loadKey("isp_settings", { companyName: "", companyPhone: "", address: "", currency: "ر.س" }));
+  const [packages, setPackages] = useState(() => loadKey("isp_packages", []));
+  const persistPackages = (next) => { setPackages(next); saveKey("isp_packages", next); };
+  const [devices, setDevices] = useState(() => loadKey("isp_devices", []));
+  const persistDevices = (next) => { setDevices(next); saveKey("isp_devices", next); };
+  const [selectedDevice, setSelectedDevice] = useState(null);
+  const [sheetDevice, setSheetDevice] = useState(null);
+  const [view, setViewRaw] = useState("home");
+  const [selected, setSelected] = useState(null);
+  const [receiptData, setReceiptData] = useState(null);
+  const [sheetSub, setSheetSub] = useState(null);
+  const setView = (v) => { setSheetSub(null); setSheetDevice(null); setViewRaw(v); };
+
+  const persistSubs = (next) => { setSubs(next); saveKey("isp_subscribers", next); };
+  const persistPayments = (next) => { setPayments(next); saveKey("isp_payments", next); };
+  const persistDebtPayments = (next) => { setDebtPayments(next); saveKey("isp_debt_payments", next); };
+  const persistSettings = (next) => { setSettings(next); saveKey("isp_settings", next); };
+
+  const makeReceipt = (sub, f, remaining) => ({
+    id: genId(), receiptNo: `INV-${String(payments.length + 1).padStart(5, "0")}`,
+    subscriberId: sub.id, subscriberName: sub.name, subscriberPhone: sub.phone,
+    package: f.package, price: f.price, durationMonths: f.durationMonths,
+    startDate: f.startDate, endDate: addMonths(f.startDate, f.durationMonths),
+    paymentType: f.paymentType || "cash", amountPaid: f.paymentType === "credit" ? Number(f.amountPaid || 0) : Number(f.price || 0),
+    remaining: remaining || 0, createdAt: todayStr(),
+  });
+
+  const handleAddSubscriber = (f) => {
+    const remaining = f.paymentType === "credit" ? Math.max(0, Number(f.price || 0) - Number(f.amountPaid || 0)) : 0;
+    const sub = { id: genId(), name: f.name, phone: f.phone, address: f.address, package: f.package, price: f.price, durationMonths: f.durationMonths, startDate: f.startDate, endDate: addMonths(f.startDate, f.durationMonths), debt: remaining, createdAt: new Date().toISOString() };
+    const receipt = makeReceipt(sub, f, remaining);
+    persistSubs([sub, ...subs]); persistPayments([receipt, ...payments]);
+    setReceiptData(receipt); setViewRaw("receipt");
+  };
+  const handleEditSubscriber = (f) => {
+    const { paymentType, amountPaid, ...rest } = f;
+    persistSubs(subs.map((s) => (s.id === selected.id ? { ...s, ...rest } : s)));
+    setViewRaw("home");
+  };
+  const handleRenew = (f) => {
+    const sub = sheetSub || selected; const newEnd = addMonths(f.startDate, f.durationMonths);
+    const remaining = f.paymentType === "credit" ? Math.max(0, Number(f.price || 0) - Number(f.amountPaid || 0)) : 0;
+    persistSubs(subs.map((s) => (s.id === sub.id ? { ...s, package: f.package, price: f.price, durationMonths: f.durationMonths, startDate: f.startDate, endDate: newEnd, debt: Number(s.debt || 0) + remaining } : s)));
+    const receipt = makeReceipt(sub, f, remaining);
+    persistPayments([receipt, ...payments]);
+    setReceiptData(receipt); setViewRaw("receipt");
+  };
+  const handleDelete = (sub) => { persistSubs(subs.filter((s) => s.id !== sub.id)); setSheetSub(null); };
+  const handlePayDebt = (amount) => {
+    const sub = sheetSub || selected;
+    persistSubs(subs.map((s) => (s.id === sub.id ? { ...s, debt: Math.max(0, Number(s.debt || 0) - amount) } : s)));
+    persistDebtPayments([{ id: genId(), subscriberId: sub.id, subscriberName: sub.name, amount, createdAt: todayStr() }, ...debtPayments]);
+    setViewRaw("home");
+  };
+
+  const handleAddDevice = (f) => {
+    persistDevices([{ id: genId(), ...f, createdAt: new Date().toISOString() }, ...devices]);
+    setViewRaw("network");
+  };
+  const handleEditDevice = (f) => {
+    persistDevices(devices.map((d) => (d.id === selectedDevice.id ? { ...d, ...f } : d)));
+    setSelectedDevice(null); setViewRaw("network");
+  };
+  const handleDeleteDevice = (d) => {
+    if (!window.confirm("حذف هذا الجهاز نهائيًا؟")) return;
+    persistDevices(devices.filter((x) => x.id !== d.id));
+    setSheetDevice(null);
+  };
+
+  let title = "المشتركين";
+  if (view === "add") title = "مشترك جديد"; if (view === "edit") title = "تعديل المشترك"; if (view === "renew") title = "تجديد الاشتراك";
+  if (view === "debt") title = "تسديد دين";
+  if (view === "receipt") title = "الوصل"; if (view === "history") title = "السجل المالي"; if (view === "settings") title = "الإعدادات"; if (view === "packages") title = "إدارة الباقات"; if (view === "network") title = "أدوات الشبكة"; if (view === "device-add") title = "إضافة جهاز"; if (view === "device-edit") title = "تعديل الجهاز"; if (view === "devices") title = "أجهزة الشبكة";
+
+  return React.createElement("div", { style: { minHeight: "100vh", background: C.paper, display: "flex", justifyContent: "center" } },
+    React.createElement("div", { style: { width: "100%", maxWidth: 460, minHeight: "100vh", position: "relative" } },
+      React.createElement(TopBar, { title, onBack: ["add", "edit", "renew", "debt", "receipt", "history", "settings", "packages", "network", "devices", "device-add", "device-edit"].includes(view) ? () => setView(view === "packages" ? "settings" : (view === "device-add" || view === "device-edit" || view === "devices") ? "network" : "home") : null }),
+      view === "home" && React.createElement(HomeScreen, { subs, onOpen: setSheetSub, onAdd: () => setView("add") }),
+      view === "network" && React.createElement(NetworkToolsScreen, { onOpenDevices: () => setView("devices"), deviceCount: devices.length }),
+      view === "devices" && React.createElement(DevicesScreen, { devices, onAdd: () => setView("device-add"), onOpen: setSheetDevice }),
+      view === "device-add" && React.createElement(DeviceForm, { onSave: handleAddDevice, onCancel: () => setView("network") }),
+      view === "device-edit" && selectedDevice && React.createElement(DeviceForm, { initial: selectedDevice, onSave: handleEditDevice, onCancel: () => setView("network") }),
+      sheetDevice && React.createElement(DeviceDetailSheet, {
+        device: sheetDevice, onClose: () => setSheetDevice(null),
+        onEdit: (d) => { setSelectedDevice(d); setSheetDevice(null); setViewRaw("device-edit"); },
+        onDelete: handleDeleteDevice
+      }),
+      view === "add" && React.createElement(SubscriberForm, { title: "بيانات المشترك والباقة", onSave: handleAddSubscriber, onCancel: () => setView("home"), packages }),
+      view === "edit" && selected && React.createElement(SubscriberForm, { title: "تعديل بيانات المشترك", initial: selected, onSave: handleEditSubscriber, onCancel: () => setView("home"), packages }),
+      view === "renew" && (sheetSub || selected) && React.createElement(RenewForm, { sub: sheetSub || selected, onSave: handleRenew, onCancel: () => setView("home"), packages }),
+      view === "debt" && (sheetSub || selected) && React.createElement(DebtPaymentForm, { sub: sheetSub || selected, onSave: handlePayDebt, onCancel: () => setView("home") }),
+      view === "receipt" && React.createElement(ReceiptScreen, { payment: receiptData, settings, onDone: () => setView("home") }),
+      view === "history" && React.createElement(HistoryScreen, { payments, debtPayments, subs, onOpen: (p) => { setReceiptData(p); setViewRaw("receipt"); } }),
+      view === "settings" && React.createElement(SettingsScreen, { settings, onSave: (f) => { persistSettings(f); setView("home"); }, onOpenPackages: () => setViewRaw("packages"), themeName, onToggleTheme: toggleTheme }),
+      view === "packages" && React.createElement(PackagesScreen, { packages, onSave: persistPackages }),
+      sheetSub && React.createElement(DetailSheet, {
+        sub: sheetSub, onClose: () => setSheetSub(null),
+        onEdit: (s) => { setSelected(s); setSheetSub(null); setViewRaw("edit"); },
+        onRenew: (s) => { setSheetSub(s); setViewRaw("renew"); },
+        onPayDebt: (s) => { setSheetSub(s); setViewRaw("debt"); },
+        onDelete: handleDelete,
+        onReceipt: (s) => { const last = [...payments].filter((p) => p.subscriberId === s.id).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0]; if (last) { setReceiptData(last); setViewRaw("receipt"); } setSheetSub(null); }
+      }),
+      view !== "receipt" && React.createElement(BottomNav, { view, setView })
+    )
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+</script>
+</body>
+</html>
